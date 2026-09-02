@@ -1,0 +1,4986 @@
+---
+title: "Almond study"
+author: "Mahak Hosseinikia"
+date: "2024-07-23"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+
+```{r}
+
+# Define the path to forward and reverse reads
+fnFs <- sort(list.files(path = "./", pattern = "_R1_.*fastq.gz", full.names = TRUE))
+
+fnRs <- sort(list.files(path = "./", pattern = "_R2_.*fastq.gz", full.names = TRUE))
+
+# Plot quality profiles for the first few files to assess reads quality
+plotQualityProfile(fnFs[1:2])
+plotQualityProfile(fnRs[1:2])
+
+# Check quality
+quality.plot.F <- plotQualityProfile(fnFs, aggregate = TRUE)
+quality.plot.R <- plotQualityProfile(fnRs, aggregate = TRUE)
+```
+
+
+```{r}
+
+# Ensure the "filtered" directory exists
+if (!dir.exists("./filtered")) {
+  dir.create("./filtered")
+}
+
+# Define primer sequences
+R1_primer <- "GTGCCAGC[AC]GCCGCGGTAA"
+R2_primer <- "GGACTAC[ACT][CGT]GGGT[AT]TCTAAT"
+R1_primer.rc <- "TTACCGCGGC[TG]GCTGGCAC"
+R2_primer.rc <- "ATTAGA[AT]ACCC[CGT][AGT]GTAGTCC"
+
+# Checking for primers in untrimmed reads
+message ('checking for primers in untrimmed reads')
+test_seqs.R1 <- getSequences(fnFs[1])
+length(test_seqs.R1)
+
+R1_matches_5prime <- data.frame(str_locate(test_seqs.R1, R1_primer))
+print(table(R1_matches_5prime))
+print(sum(table(R1_matches_5prime)) / length(test_seqs.R1) * 100)
+
+
+R1_matches_3prime <- data.frame(str_locate(test_seqs.R1, R2_primer.rc))
+print(table(R1_matches_3prime))
+
+test_seqs.R2 <- getSequences(fnRs[1])
+length(test_seqs.R2)
+R2_matches_5prime <- data.frame(str_locate(test_seqs.R2, R2_primer))
+print(table(R2_matches_5prime))
+print(sum(table(R2_matches_5prime)) / length(test_seqs.R2)* 100)
+
+R2_matches_3prime <- data.frame(str_locate(test_seqs.R2, R1_primer.rc))
+print(table(R2_matches_3prime))
+
+
+# Define filtered file paths
+filtFs <- file.path("./filtered", paste0(basename(fnFs)))
+filtRs <- file.path("./filtered", paste0(basename(fnRs)))
+
+
+
+# Filter and trim sequences (including removal of 5' primers/adapters if present)
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen = c(240,200), maxN = 0, maxEE = c(2,2), truncQ = 2, rm.phix= TRUE, compress = TRUE, multithread = 6)
+
+print("Filter and trim output:")
+print(out)
+
+
+# Check if trimming was successful 
+plotQualityProfile(filtFs[1:2])
+plotQualityProfile(filtRs[1:2])
+
+message("Checking for primers in remaining trimmed reads")
+
+test_seqs.R1.trimmed <- getSequences(filtFs[1])
+R1_matches_5prime.trimmed <- data.frame(str_locate(test_seqs.R1.trimmed, R1_primer))
+print(table(R1_matches_5prime.trimmed))
+
+```
+
+
+#Error rates
+```{r}
+# Calculate error rates 
+timestamp()
+errF <- learnErrors(filtFs, multithread = TRUE)
+saveRDS(errF, file = "errF_sampled.rds")
+errR <- learnErrors(filtRs, multithread = TRUE)
+saveRDS(errR, file = "errR_sampled.rds")
+timestamp ()
+
+# Plot error rates
+plotFerr <- plotErrors(errF, nominalQ= TRUE)
+suppressWarnings(print(plotFerr))
+plotRerr <- plotErrors(errR, nominalQ = TRUE)
+suppressWarnings(print(plotRerr))
+
+```
+
+
+# Denoise and Dereplicate sequences
+```{r}
+# Set up lists with correct length and names
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+
+mergers <- vector("list", length(sample.names))
+names(mergers)<- sample.names
+dadaFs <- mergers
+dadaRs <- mergers
+
+# Process reads serially
+timestamp()
+for (sam in sample.names) {
+  message("Processing sample:", sam)
+  
+  # Check if the sample exist in filtFs and filtRs
+  if(sam %in% names(filtFs) && sam %in%names(filtRs)) {
+    derepF <- derepFastq(filtFs[[sam]])
+    derepR <- derepFastq(filtRs[[sam]])
+    dadaF <- dada(derepF, err = errF, multithread = TRUE)
+    dadaFs[[sam]] <- dadaF
+    dadaR <- dada (derepR, err = errR, multithread = TRUE)
+    dadaRs[[sam]] <- dadaR
+    merger <- mergePairs(dadaF, derepF, dadaR, derepR, verbose = TRUE)
+    mergers[[sam]]<- merger
+  } else {
+    message("Sample", sam, "not found in filtered file list.")
+  }
+  
+  
+}
+timestamp()
+
+# Save results
+saveRDS(dadaFs, "dadaFs_sampled.rds")
+saveRDS(dadaRs, "dadaRs_sampled.rds")
+saveRDS(mergers, "mergers_sampled.rds")
+```
+
+
+
+
+
+# Generate ASV and Taxonomy tables
+```{r}
+# Loading pre-processed data
+dadaFs <- readRDS("dadaFs_sampled.rds")
+dadaRs <- readRDS("dadaRs_sampled.rds")
+mergers <- readRDS("mergers_sampled.rds")
+
+# Create a sequence table
+seqtab <- makeSequenceTable(mergers)
+saveRDS(seqtab, "seqtab_sampled.rds")
+seqtab <- readRDS("seqtab_sampled.rds")
+
+# Check the structure of the sequence table
+print("Sequence table structure:")
+str(seqtab)
+
+# Check sequence lengths (Identify the length distribution of the merged sequences)
+Sequence_lengths <- table(nchar(getSequences(seqtab)))
+print("Sequence lengths:")
+print(Sequence_lengths)
+write.table(Sequence_lengths, "seqlengths.tab", row.names = F, col.names = F, sep = "\t", quote = F)
+
+
+#Filter Sequences by length to retain those within the expected range (250-256 bp)
+seqtab<- seqtab[, nchar(colnames(seqtab)) %in% seq(250,256)]
+saveRDS(seqtab, "seqtabfilt_sampled.rds")
+seqtab<- readRDS("seqtabfilt_sampled.rds")
+
+
+# Remove Chimeric sequences and save results
+seqtab.nochim <- removeBimeraDenovo(seqtab, method= "consensus", multithread=TRUE, verbose=TRUE)
+saveRDS(seqtab.nochim, "seqtabnochim_sampled.rds")
+seqtab.nochim<- readRDS("seqtabnochim_sampled.rds")
+
+# Check the structure of the no-chimera sequence table
+print("No-chimera sequence table structure:")
+str(seqtab.nochim)
+
+#Track the number of reads through each step of the Pipeline
+getN <- function(x) sum(getUniques(x))
+track <- data.frame(
+  input = out[, "reads.in"],
+  filtered = out[, "reads.out"],
+  denoised = sapply(dadaFs, getN),
+  merged = sapply(mergers, getN),
+  tabled = rowSums(seqtab),
+  nochim = rowSums(seqtab.nochim)
+)
+
+
+# Calculate and Save Percent of Reads Retained
+track$percent<- signif(track$nochim / track$input * 100, 4)
+write.table(track, "tracked.tab", sep="\t", quote =F, row.names= T, col.names=NA)
+```
+
+
+
+# Assign Taxonomy
+```{r}
+
+# Define the path to the SILVA files
+silva_path <- "/local/cqls/db/dada2"
+
+taxonomy_file <- file.path(silva_path, "silva_nr99_v138.1_train_set.fa.gz")
+species_file <- file.path(silva_path, "silva_species_assignment_v138.1.fa.gz")
+
+# Set seed to ensure reproducibility
+set.seed(123)
+
+# Assign taxonomy using the correct files
+taxa <- assignTaxonomy(seqtab.nochim, taxonomy_file, multithread = TRUE, add) 
+taxa <- addSpecies(taxa, species_file)
+
+# Convert the taxonomy table to a data frame to make adjustments
+tax_table_df <- as.data.frame(taxa)
+
+# Fill in missing Genus with Family, and missing Family with Order
+tax_table_df <- tax_table_df %>%
+  mutate(
+    Genus = ifelse(is.na(Genus), Family, Genus),  
+    Family = ifelse(is.na(Family), Order, Family) 
+  )
+
+# Convert the adjusted data frame back to a tax_table object
+taxa <- as.matrix(tax_table_df)
+
+# Save the adjusted taxonomy object
+saveRDS(taxa, "taxa_sampled.rds")
+
+```
+
+
+# Phyloseq object
+```{r}
+# Load necessary libraries
+library(phyloseq)
+library(tidyverse)
+library(microViz)
+
+# Load pre-processed OTU table and taxonomy table
+seqtab.nochim.full <- readRDS("seqtabnochim_sampled.rds")
+taxa <- readRDS("taxa_sampled.rds")
+
+# Load the updated metadata
+metadata <- read.csv("Almond_Updated_Metadata.csv", header = TRUE, stringsAsFactors = FALSE)
+
+
+# Assign 'ID' column as rownames for metadata
+rownames(metadata) <- metadata$ID
+
+# Ensure OTU table sample names align with metadata rownames
+rownames(seqtab.nochim.full) <- metadata$ID
+
+# Transform the Treatment column to a factor with proper labels
+metadata <- metadata %>%
+  mutate(
+    Treatment = factor(Treatment, levels = c(0, 1), labels = c("Cracker", "Almond"))
+  )
+
+#  Convert metadata to a phyloseq-compatible sample_data object
+sample_data_object <- sample_data(metadata)
+
+
+# Create the phyloseq object
+ps <- phyloseq(
+  otu_table(seqtab.nochim.full, taxa_are_rows = FALSE),
+  tax_table(taxa),
+  sample_data(sample_data_object)
+)
+
+# Apply filtering criteria
+ps_filtered <- ps %>%
+  tax_select(c("Chloroplast", "Mitochondria"), deselect = TRUE) %>%
+  tax_filter(min_prevalence = 3)
+
+# Verify metadata integrity in filtered object
+nsamples(ps_filtered)
+table(sample_data(ps_filtered)$Treatment, useNA = "ifany")
+
+# Number of taxa remaining after filtering
+ntaxa(ps_filtered)
+
+# Save the filtered phyloseq object
+saveRDS(ps_filtered, "ps_filtered.rds")
+
+# Export the ASV and taxonomy tables after filtering
+# Convert OTU table to a data frame and then to a tibble
+otu_table_df <- as.data.frame(otu_table(ps_filtered))
+otu_table_tibble <- as_tibble(otu_table_df, rownames = "sample_name") 
+write_tsv(otu_table_tibble, "filtered_asv_table.tab")
+
+# Convert taxonomy table to a data frame and then to a tibble
+tax_table_df <- as.data.frame(tax_table(ps_filtered))
+tax_table_tibble <- as_tibble(tax_table_df, rownames = "ASV")  
+write_tsv(tax_table_tibble, "filtered_taxa_table.tab")
+
+```
+
+
+
+#Alpha diversity based on effective species(Week0 to Week12)
+```{r}
+# Load necessary libraries
+library(microViz)
+library(phyloseq)
+library(ggpubr)
+library(cowplot)
+library(RColorBrewer)
+library(tidyverse)
+library(rstatix)
+library(broom.mixed)
+
+
+# Calculate effective species diversity 
+alpha_div <- ps_filtered %>%
+  ps_calc_diversity(rank = "unique", index = "shannon", exp = TRUE) %>%
+  ps_calc_diversity(rank = "unique", index = "gini_simpson", exp = FALSE) %>%
+  ps_mutate(gini_simpson_unique_eff = 1 / (1 - gini_simpson_unique)) %>%
+  samdat_tbl()
+
+
+# Subset the data to include only Week 0 and Week 12
+filtered_alpha <- alpha_div %>%
+  filter(Week %in% c(0, 12)) %>%
+  select(-.sample_name) %>%  
+  mutate(
+    Week = factor(Week), 
+    Treatment = factor(Treatment, levels = c("Cracker", "Almond"))
+  )
+
+
+# Define color palette
+primary.colpal <- c("Cracker" = "red", "Almond" = "blue") 
+
+# Define a unified theme for plots
+common_theme <- theme_pubr(base_size = 10) +  
+  theme(
+    axis.text.x = element_text(size = 10),    
+    axis.text.y = element_text(size = 10),    
+    axis.title.x = element_text(size = 12),   
+    axis.title.y = element_text(size = 12),   
+    legend.text = element_text(size = 10),    
+    legend.title = element_blank()            
+  )
+
+# Create the Shannon plot
+shannon.p <- ggboxplot(
+  data = filtered_alpha,
+  x = "Week",
+  y = "exp_shannon_unique",
+  ylab = "Shannon Entropy",  
+  fill = "Treatment",
+  palette = primary.colpal,
+  ggtheme = common_theme,
+  outlier.shape = 16,
+  outlier.size = 2
+) +
+  stat_compare_means(
+    method = "wilcox.test", 
+    paired = TRUE,
+    label = "p.format",
+    size = 5,
+    label.y = 35
+  ) +
+  facet_wrap(~ Treatment, strip.position = "bottom") +
+  theme(strip.background = element_blank(), strip.text = element_blank())
+
+# Create the Gini-Simpson plot 
+simpson.p <- ggboxplot(
+  data = filtered_alpha,
+  x = "Week",
+  y = "gini_simpson_unique_eff",
+  ylab = "Gini-Simpson",  
+  fill = "Treatment",
+  palette = primary.colpal,
+  ggtheme = common_theme,
+  outlier.shape = 16,
+  outlier.size = 2
+) +
+  stat_compare_means(
+    method = "wilcox.test",
+    paired = TRUE,
+    label = "p.format",
+    size = 5,
+    label.y = 25 
+  ) +
+  facet_wrap(~ Treatment, strip.position = "bottom") +
+  theme(strip.background = element_blank(), strip.text = element_blank())
+
+# Combine the plots
+combined_plot <- ggarrange(
+  shannon.p, simpson.p,
+  common.legend = TRUE,
+  legend = "right",  
+  ncol = 1
+) +
+  theme(plot.background = element_rect(fill = "white", color = NA))
+
+# Add title and save the final plot 
+final_plot <- annotate_figure(
+  combined_plot,
+  top = text_grob("Alpha Diversity Analysis", size = 14, face = "bold")  
+)
+
+# Save and display the final plot
+cowplot::save_plot("alpha_diversity_filtered.png", final_plot, base_height = 10, base_width = 8)
+print(final_plot)
+
+
+
+# Calculate IQR for Shannon Entropy
+shannon_q1 <- quantile(filtered_alpha$exp_shannon_unique, 0.25, na.rm = TRUE)
+shannon_q3 <- quantile(filtered_alpha$exp_shannon_unique, 0.75, na.rm = TRUE)
+shannon_iqr <- shannon_q3 - shannon_q1
+shannon_lower_bound <- shannon_q1 - 1.5 * shannon_iqr
+shannon_upper_bound <- shannon_q3 + 1.5 * shannon_iqr
+
+# Calculate IQR for Gini-Simpson
+simpson_q1 <- quantile(filtered_alpha$gini_simpson_unique_eff, 0.25, na.rm = TRUE)
+simpson_q3 <- quantile(filtered_alpha$gini_simpson_unique_eff, 0.75, na.rm = TRUE)
+simpson_iqr <- simpson_q3 - simpson_q1
+simpson_lower_bound <- simpson_q1 - 1.5 * simpson_iqr
+simpson_upper_bound <- simpson_q3 + 1.5 * simpson_iqr
+
+# Identify outliers
+outliers_shannon <- filtered_alpha %>%
+  filter(exp_shannon_unique < shannon_lower_bound | exp_shannon_unique > shannon_upper_bound)
+
+outliers_simpson <- filtered_alpha %>%
+  filter(gini_simpson_unique_eff < simpson_lower_bound | gini_simpson_unique_eff > simpson_upper_bound)
+
+# Combine all outliers into one dataset
+outliers_data <- bind_rows(
+  mutate(outliers_shannon, Metric = "Shannon Entropy"),
+  mutate(outliers_simpson, Metric = "Gini-Simpson")
+)
+
+filtered_alpha <- alpha_div %>%
+  filter(Week %in% c(0, 12)) %>%
+  select(-.sample_name) %>%
+  mutate(
+    ID = if_else(ID == "ALM105_5", "ALM105_12", ID),
+    subject = sub("_(0|4|12)$", "", ID),
+    Week = factor(Week, levels = c(0, 12)),
+    Treatment = factor(Treatment, levels = c("Cracker", "Almond"))
+  ) %>%
+  group_by(subject) %>%
+  filter(n_distinct(Week) == 2) %>%
+  ungroup() %>%
+  arrange(Treatment, subject, Week)
+
+table(filtered_alpha$Week, filtered_alpha$Treatment)
+
+filtered_alpha %>%
+  filter(subject == "ALM105") %>%
+  select(ID, subject, Week, Treatment)
+
+# Define color palette
+primary.colpal <- c(
+  "Cracker" = "red",
+  "Almond" = "blue"
+)
+
+# Define a common theme
+common_theme <- theme_pubr(base_size = 11) +
+  theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    strip.background = element_blank(),
+    strip.text = element_text(
+      size = 11,
+      face = "bold"
+    ),
+    legend.position = "none")
+
+
+
+# REVISED
+# Shannon effective number of species
+shannon.p <- ggboxplot(
+  data = filtered_alpha,
+  x = "Week",
+  y = "exp_shannon_unique",
+  fill = "Treatment",
+  palette = primary.colpal,
+  ggtheme = common_theme,
+  outlier.shape = 16,
+  outlier.size = 2,
+  width = 0.65
+) +
+  facet_wrap(
+    ~ Treatment,
+    nrow = 1
+  ) +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    legend.position = "none",
+
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+
+    axis.text.y = element_text(
+      size = 10,
+      face = "bold"
+    )
+  )
+
+
+# Simpson effective number of species
+simpson.p <- ggboxplot(
+  data = filtered_alpha,
+  x = "Week",
+  y = "gini_simpson_unique_eff",
+  fill = "Treatment",
+  palette = primary.colpal,
+  ggtheme = common_theme,
+  outlier.shape = 16,
+  outlier.size = 2,
+  width = 0.65
+) +
+  facet_wrap(
+    ~ Treatment,
+    nrow = 1
+  ) +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    legend.position = "none",
+
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+
+    axis.text.y = element_text(
+      size = 10,
+      face = "bold"
+    )
+  )
+
+final_plot <- ggarrange(
+  shannon.p,
+  simpson.p,
+  ncol = 1,
+  nrow = 2,
+  align = "v",
+  heights = c(1, 1)
+)
+
+print(final_plot)
+```
+
+
+
+
+
+
+
+# Beta Diversity excluding week4
+```{r}
+library(phyloseq)
+library(microViz)
+library(vegan)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(ggvegan)
+
+
+#outliers <- c("ALM004_12", "ALM011_0", "ALM011_12", "ALM013_0", 
+             # "ALM099_0", "ALM099_12", "ALM102_12", "ALM149_0", "ALM161_12")
+
+ps2 <- readRDS("ps_filtered (2).rds")
+ps2 <- ps2 %>%
+  tax_transform("compositional") %>%
+  ps_filter (Week %in% c(0,12)) 
+  #ps_filter(!ID %in% outliers)
+
+
+# Get OTU table and Sample data
+otu.df <- ps2 %>% otu_get() %>% data.frame()
+
+samdat <- ps2 %>%
+  samdat_tbl()%>%
+  dplyr::select(-.sample_name)
+  
+
+# Ensure Week is numeric
+  samdat$Week <- as.numeric(as.character(samdat$Week))
+  
+# Ensure Treatment and Week are factors
+samdat$Treatment <- factor(samdat$Treatment,  labels = c("Cracker", "Almond"))
+samdat$Week <- factor(samdat$Week, levels = c(0,12), labels = c("Week0", "Week12"))
+
+
+# Bray-Curtis dissimilarity and square root transformation
+bray <- vegdist(otu.df, method = "bray") %>% sqrt()
+
+# Run dbRDA
+set.seed(12345)
+dbrda.res <- dbrda(bray ~ Treatment*Week, data = samdat)
+anova_b <- anova(dbrda.res, by = "terms", permutations = 999)
+print(anova_b)
+
+# Calculate % Variance explained
+dbrda.res.eigenvals <- eigenvals(dbrda.res)
+p.explained <- dbrda.res.eigenvals[c("dbRDA1", "dbRDA2")] / sum(dbrda.res.eigenvals) * 100
+
+# Get site scores
+scores_df <- as.data.frame(scores(dbrda.res, display = "sites"))
+
+# Add sample metadata (merge with samdat by rownames)
+scores_df$ID <- rownames(scores_df)
+samdat$ID <- as.character(samdat$ID)
+
+# Merge scores with sample metadata
+plot_df <- left_join(scores_df, samdat, by = "ID")
+
+# Extract biplot arrows
+arrow_df <- as.data.frame(scores(dbrda.res, display = "bp"))
+arrow_df$Variable <- rownames(arrow_df)
+
+arrow_df$dbRDA1 <- arrow_df$dbRDA1 * 1.5 
+arrow_df$dbRDA2 <- arrow_df$dbRDA2 * 1.5
+
+
+#  dbRDA plot
+dbrda.p <- ggplot(plot_df, aes(x = dbRDA1, y = dbRDA2)) +
+  geom_point(aes(fill = Treatment, shape = Week),
+             size = 2.3, alpha = 1,
+             color = "black", stroke = 0.5) +
+
+  geom_segment(data = arrow_df,
+               aes(x = 0, y = 0, xend = dbRDA1, yend = dbRDA2),
+               arrow = arrow(length = unit(0.25, "cm")),
+               color = "black", size = 0.5, inherit.aes = FALSE) +
+
+  scale_fill_brewer(palette = "Set1", name = "Treatment") +
+  scale_shape_manual(name = "Week", values = c("Week0" = 21, "Week12" = 22)) +
+
+  guides(color = "none", fill = guide_legend(override.aes = list(shape = 21))) +
+
+  xlab(paste0("dbRDA1 [", sprintf("%.2f", p.explained[1]), "%]")) +
+  ylab(paste0("dbRDA2 [", sprintf("%.2f", p.explained[2]), "%]")) +
+  theme_classic()
+
+cowplot::save_plot("dbRDA_Week012.png", dbrda.p, base_height = 5, base_width = 7, dpi = 300)
+
+
+# PERMANOVA test
+set.seed(12345)
+adonis2(bray ~ Treatment * Week, data = samdat, by = "term", permutations = 999)
+
+# Test for homogeneity of dispersion
+set.seed(12345)
+betadisper(bray, samdat$Treatment) %>% permutest()
+
+
+
+
+
+
+#### Check the difference at baseline and week 12 separately
+# Subset based on week
+ps_week0 <- ps2 %>% ps_filter(Week == 0)
+ps_week12 <- ps2 %>% ps_filter(Week == 12)
+
+
+# Week0
+otu0 <- otu_get(ps_week0)
+meta0 <- samdat_tbl(ps_week0)
+bray0 <- vegdist(otu0, "bray")
+set.seed(12345)
+adonis2(bray0 ~ Treatment, data = meta0)
+
+# Week 12
+otu12 <- otu_get(ps_week12)
+meta12 <- samdat_tbl(ps_week12)
+bray12 <- vegdist(otu12, method = "bray")
+set.seed(12345)
+adonis2(bray12 ~ Treatment, data = meta12)
+
+
+###### Subset to Almond
+
+ps_almond <- ps2 %>%
+  ps_filter(Treatment == "Almond", Week %in% c(0,12))
+
+otu_almond <- otu_get(ps_almond)
+meta_almond <- samdat_tbl(ps_almond)
+bray_almond <- vegdist(otu_almond, method = "bray")
+
+# Check if week is a factor
+meta_almond$Week <- factor(meta_almond$Week)
+
+set.seed(12345)
+adonis2(bray_almond ~ Week, data = meta_almond)
+
+###### Subset to Cracker
+
+ps_cracker <- ps2 %>%
+  ps_filter(Treatment == "Cracker", Week %in% c(0,12))
+
+otu_cracker <- otu_get(ps_cracker)
+meta_cracker <- samdat_tbl(ps_cracker)
+bray_cracker <- vegdist(otu_cracker, method = "bray")
+
+# Check if week is a factor
+meta_cracker$Week <- factor(meta_cracker$Week)
+
+set.seed(12345)
+adonis2(bray_cracker ~ Week, data = meta_cracker)
+
+
+```
+
+
+# Bayesian Differential Abundance Analysis
+```{r}
+# Bayesian Differential Abundance Analysis
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(phyloseq)
+  library(microViz)
+  library(rstanarm)
+  library(posterior)
+  library(emmeans)
+  library(purrr)
+})
+
+
+# Load and prepare data
+ps_filtered <- readRDS("ps_filtered (2).rds")
+
+genus_df <- tax_glom(ps_filtered, taxrank = "Genus", NArm = TRUE) %>%
+  ps_melt() %>%
+  mutate(
+    Sample = if_else(Sample == "ALM105_5", "ALM105_12", Sample),
+    Treatment = factor(Treatment, levels = c("Cracker", "Almond")),
+    Week = factor(
+      Week,
+      levels = c(0, 4, 12),
+      labels = c("Week0", "Week4", "Week12")
+    ),
+    Subject = sub("_[^_]+$", "", Sample)
+  ) %>%
+  dplyr::select(-ID) %>%
+  group_by(Sample) %>%
+  mutate(
+    total = sum(Abundance)
+  ) %>%
+  ungroup()
+
+
+# Sanity checks
+stopifnot(all(is.finite(genus_df$total)))
+stopifnot(all(genus_df$total > 0))
+stopifnot(all(genus_df$Abundance >= 0))
+stopifnot(all(!is.na(genus_df$Subject)))
+
+
+# Filter very sparse genera
+filter_sparse <- TRUE
+min_nonzero_samples <- 10
+
+if (filter_sparse) {
+  
+  genus_sparsity <- genus_df %>%
+    group_by(Genus) %>%
+    summarise(
+      n_samples = n_distinct(Sample),
+      nonzero_n = sum(Abundance > 0),
+      prevalence = nonzero_n / n_samples,
+      .groups = "drop"
+    )
+  
+  keep_genera <- genus_sparsity %>%
+    filter(nonzero_n >= min_nonzero_samples) %>%
+    pull(Genus)
+  
+  cat(
+    "Before filtering genera:",
+    n_distinct(genus_df$Genus),
+    "\n"
+  )
+  
+  genus_df <- genus_df %>%
+    filter(Genus %in% keep_genera)
+  
+  cat(
+    "After filtering genera:",
+    n_distinct(genus_df$Genus),
+    "\n"
+  )
+  
+  saveRDS(
+    genus_sparsity,
+    "genus_sparsity_summary.rds"
+  )
+}
+
+
+# Nest by Genus
+nested_data <- genus_df %>%
+  group_by(Genus) %>%
+  nest()
+
+cat(
+  "Number of genera:",
+  nrow(nested_data),
+  "\n"
+)
+
+
+# Bayesian model function
+run_bayes <- function(
+    df,
+    link = "log",
+    chains = 4,
+    iter = 4000,
+    adapt_delta = 0.99,
+    seed = 12345
+) {
+  
+  rstanarm::stan_glmer(
+    Abundance ~
+      Treatment * Week +
+      offset(log(total)) +
+      (1 | Subject),
+    data = df,
+    family = rstanarm::neg_binomial_2(link = link),
+    prior_intercept = rstanarm::normal(-4, 1),
+    prior = rstanarm::normal(0, 0.5),
+    chains = chains,
+    iter = iter,
+    adapt_delta = adapt_delta,
+    seed = seed,
+    refresh = 0
+  )
+}
+
+
+# Run models safely and capture warnings/errors
+quiet_run_bayes <- purrr::quietly(run_bayes)
+safe_quiet_run <- purrr::safely(quiet_run_bayes)
+
+cat("Fitting models...\n")
+
+bayes_results <- nested_data %>%
+  mutate(
+    out = map(
+      data,
+      ~ safe_quiet_run(
+        .x,
+        chains = 4,
+        iter = 4000,
+        adapt_delta = 0.99
+      )
+    )
+  ) %>%
+  mutate(
+    fit = map(
+      out,
+      ~ if (is.null(.x$result)) NULL else .x$result$result
+    ),
+    warnings = map(
+      out,
+      ~ if (is.null(.x$result)) character() else .x$result$warnings
+    ),
+    messages = map(
+      out,
+      ~ if (is.null(.x$result)) character() else .x$result$messages
+    ),
+    error_obj = map(out, "error"),
+    err_msg = map_chr(
+      error_obj,
+      ~ if (is.null(.x)) NA_character_ else .x$message
+    ),
+    n_warn = map_int(warnings, length)
+  ) %>%
+  dplyr::select(-out)
+
+
+# Save full model results
+saveRDS(
+  bayes_results,
+  "bayes_results_full.rds"
+)
+
+cat(
+  "Models attempted:",
+  nrow(bayes_results),
+  "\n"
+)
+
+cat(
+  "Models succeeded:",
+  sum(!map_lgl(bayes_results$fit, is.null)),
+  "\n"
+)
+
+cat(
+  "Models failed:",
+  sum(!is.na(bayes_results$err_msg)),
+  "\n"
+)
+
+
+# Save model errors
+fit_errors <- bayes_results %>%
+  filter(!is.na(err_msg)) %>%
+  dplyr::select(
+    Genus,
+    err_msg
+  )
+
+saveRDS(
+  fit_errors,
+  "bayes_fit_errors.rds"
+)
+
+
+# Save model warnings
+fit_warnings <- bayes_results %>%
+  mutate(
+    warn_text = map_chr(
+      warnings,
+      ~ paste(.x, collapse = " | ")
+    )
+  ) %>%
+  filter(n_warn > 0) %>%
+  dplyr::select(
+    Genus,
+    n_warn,
+    warn_text
+  )
+
+saveRDS(
+  fit_warnings,
+  "bayes_fit_warnings.rds"
+)
+
+
+# Keep successfully fitted models
+bayes_results_clean <- bayes_results %>%
+  filter(
+    !map_lgl(fit, is.null)
+  )
+
+saveRDS(
+  bayes_results_clean,
+  "bayes_results_clean.rds"
+)
+
+
+# Standardize credible interval column names
+standardize_ci_cols <- function(df) {
+  
+  df <- as_tibble(df)
+  nms <- names(df)
+  
+  lower_candidates <- c(
+    "lower.HPD",
+    "lower.CL",
+    "asymp.LCL",
+    "LCL",
+    "lower"
+  )
+  
+  upper_candidates <- c(
+    "upper.HPD",
+    "upper.CL",
+    "asymp.UCL",
+    "UCL",
+    "upper"
+  )
+  
+  lower_col <- intersect(
+    lower_candidates,
+    nms
+  )[1]
+  
+  upper_col <- intersect(
+    upper_candidates,
+    nms
+  )[1]
+  
+  if (!is.na(lower_col) && !is.na(upper_col)) {
+    
+    df <- df %>%
+      rename(
+        conf.low = all_of(lower_col),
+        conf.high = all_of(upper_col)
+      )
+    
+  } else if (all(c("estimate", "SE") %in% nms)) {
+    
+    df <- df %>%
+      mutate(
+        conf.low = estimate - 1.96 * SE,
+        conf.high = estimate + 1.96 * SE
+      )
+    
+  } else if (all(c("estimate", "std.error") %in% nms)) {
+    
+    df <- df %>%
+      mutate(
+        conf.low = estimate - 1.96 * std.error,
+        conf.high = estimate + 1.96 * std.error
+      )
+    
+  } else {
+    
+    stop(
+      "Cannot find CI columns or compute them. Columns are: ",
+      paste(nms, collapse = ", ")
+    )
+  }
+  
+  if ("SE" %in% names(df) &&
+      !"std.error" %in% names(df)) {
+    
+    df <- df %>%
+      rename(
+        std.error = SE
+      )
+  }
+  
+  df
+}
+
+
+# Calculate Bayesian contrasts
+run_emmeans_bayes <- function(
+    fit_obj,
+    debug = FALSE
+) {
+  
+  emm <- emmeans::emmeans(
+    fit_obj,
+    ~ Treatment * Week,
+    at = list(
+      Treatment = c("Cracker", "Almond"),
+      Week = c("Week0", "Week4", "Week12")
+    )
+  )
+  
+  ctr <- emmeans::contrast(
+    emm,
+    method = list(
+      "ALM4_vs_ALM0" = c(0, -1, 0, 1, 0, 0),
+      "ALM12_vs_ALM0" = c(0, -1, 0, 0, 0, 1),
+      "ALM12_vs_ALM4" = c(0, 0, 0, -1, 0, 1),
+      "CRK4_vs_CRK0" = c(-1, 0, 1, 0, 0, 0),
+      "CRK12_vs_CRK0" = c(-1, 0, 0, 0, 1, 0),
+      "CRK12_vs_CRK4" = c(0, 0, -1, 0, 1, 0),
+      "ALM0_vs_CRK0" = c(-1, 1, 0, 0, 0, 0),
+      "ALM4_vs_CRK4" = c(0, 0, -1, 1, 0, 0),
+      "ALM12_vs_CRK12" = c(0, 0, 0, 0, -1, 1)
+    )
+  )
+  
+  ci_obj <- try(
+    confint(ctr),
+    silent = TRUE
+  )
+  
+  if (!inherits(ci_obj, "try-error")) {
+    
+    ci_df <- as.data.frame(ci_obj)
+    
+    if (debug) {
+      cat("\n[DEBUG] confint(ctr) columns:\n")
+      print(names(ci_df))
+      
+      cat("[DEBUG] head(confint):\n")
+      print(utils::head(ci_df))
+    }
+    
+    out <- standardize_ci_cols(ci_df)
+    
+  } else {
+    
+    td <- broom::tidy(ctr)
+    
+    if (debug) {
+      cat("\n[DEBUG] broom::tidy(ctr) columns:\n")
+      print(names(td))
+      
+      cat("[DEBUG] head(tidy):\n")
+      print(utils::head(td))
+    }
+    
+    out <- standardize_ci_cols(td)
+  }
+  
+  out
+}
+
+
+# Run contrasts safely
+safe_emm <- purrr::safely(run_emmeans_bayes)
+
+emmeans_results_nested <- bayes_results_clean %>%
+  mutate(
+    em_out = map(
+      fit,
+      ~ safe_emm(.x, debug = FALSE)
+    ),
+    emms = map(em_out, "result"),
+    em_err = map(em_out, "error"),
+    em_err_msg = map_chr(
+      em_err,
+      ~ if (is.null(.x)) NA_character_ else .x$message
+    )
+  ) %>%
+  dplyr::select(
+    Genus,
+    emms,
+    em_err_msg
+  )
+
+
+# Save raw contrast outputs
+saveRDS(
+  emmeans_results_nested,
+  "bayes_emmeans_contrasts_RAW_nested.rds"
+)
+
+
+# Flatten successful contrasts
+emmeans_flat <- emmeans_results_nested %>%
+  filter(
+    map_lgl(
+      emms,
+      ~ !is.null(.x)
+    )
+  ) %>%
+  dplyr::select(
+    Genus,
+    emms
+  ) %>%
+  unnest(emms)
+
+stopifnot(
+  all(
+    c("conf.low", "conf.high") %in%
+      names(emmeans_flat)
+  )
+)
+
+saveRDS(
+  emmeans_flat,
+  "bayes_emmeans_contrasts.rds"
+)
+
+
+# Identify contrasts with 95% CrI excluding zero
+emm_sig <- emmeans_flat %>%
+  filter(
+    conf.low > 0 |
+      conf.high < 0
+  )
+
+saveRDS(
+  emm_sig,
+  "bayes_emmeans_significant.rds"
+)
+
+
+# Save contrast errors
+emmeans_errors <- emmeans_results_nested %>%
+  filter(
+    !is.na(em_err_msg)
+  ) %>%
+  dplyr::select(
+    Genus,
+    em_err_msg
+  )
+
+saveRDS(
+  emmeans_errors,
+  "bayes_emmeans_errors.rds"
+)
+
+
+# Bayesian Differential Abundance Analysis
+
+# Libraries
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(posterior)
+library(rstan)
+library(rstanarm)
+library(phyloseq)
+library(microViz)
+library(ggplot2)
+library(forcats)
+library(cowplot)
+
+
+# Load Bayesian outputs
+emm_sig <- readRDS("bayes_emmeans_significant.rds")
+bayes_results_clean <- readRDS("bayes_results_clean.rds")
+
+
+# MCMC diagnostic function
+get_mcmc_diag <- function(fit_obj) {
+  
+  fixef_terms <- names(rstanarm::fixef(fit_obj))
+  
+  posterior::summarise_draws(
+    posterior::as_draws_array(fit_obj),
+    "rhat", "ess_bulk", "ess_tail"
+  ) %>%
+    tibble::as_tibble() %>%
+    dplyr::rename(term = variable) %>%
+    dplyr::filter(term %in% fixef_terms)
+}
+
+
+# Divergence function
+get_divergences <- function(fit_obj) {
+  
+  sp <- rstan::get_sampler_params(
+    fit_obj$stanfit,
+    inc_warmup = FALSE
+  )
+  
+  sum(sapply(sp, function(x) sum(x[, "divergent__"])))
+}
+
+
+# Extract models for genera with significant contrasts
+sig_genera <- unique(emm_sig$Genus)
+
+bayes_sig_models <- bayes_results_clean %>%
+  filter(Genus %in% sig_genera)
+
+
+# Run MCMC diagnostics
+diag_sig <- bayes_sig_models %>%
+  mutate(
+    diag = purrr::map(fit, get_mcmc_diag),
+    n_divergent = purrr::map_int(fit, get_divergences)
+  ) %>%
+  tidyr::unnest(diag)
+
+
+# Flag unreliable model parameters
+diag_flagged <- diag_sig %>%
+  mutate(
+    bad = rhat > 1.01 |
+      ess_bulk < 400 |
+      ess_tail < 400 |
+      n_divergent > 0
+  )
+
+
+# Identify genera with any problematic model parameter
+bad_genera <- diag_flagged %>%
+  filter(bad) %>%
+  distinct(Genus)
+
+
+# Identify genera with acceptable diagnostics
+good_genera <- diag_flagged %>%
+  group_by(Genus) %>%
+  summarise(
+    any_bad = any(bad),
+    .groups = "drop"
+  ) %>%
+  filter(!any_bad) %>%
+  pull(Genus)
+
+
+# Keep significant contrasts from reliable models
+emm_sig_reliable <- emm_sig %>%
+  filter(Genus %in% good_genera)
+
+
+# Summarize diagnostics for reliable genera
+diag_reliable_summary <- diag_sig %>%
+  filter(Genus %in% unique(emm_sig_reliable$Genus)) %>%
+  group_by(Genus) %>%
+  summarise(
+    max_rhat = max(rhat, na.rm = TRUE),
+    min_ess_bulk = min(ess_bulk, na.rm = TRUE),
+    min_ess_tail = min(ess_tail, na.rm = TRUE),
+    max_n_divergent = max(n_divergent, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(max_rhat))
+
+
+# Save diagnostic results
+saveRDS(diag_sig, "bayes_diagnostics_significant_genera.rds")
+saveRDS(diag_reliable_summary, "bayes_diagnostics_reliable_genera.rds")
+saveRDS(emm_sig_reliable, "bayes_emmeans_significant_reliable.rds")
+
+
+# Function to get posterior draws for contrasts
+get_contrast_draws <- function(fit_obj) {
+  
+  draws <- posterior::as_draws_df(fit_obj)
+  
+  b_trt <- "TreatmentAlmond"
+  b_w4 <- "WeekWeek4"
+  b_w12 <- "WeekWeek12"
+  b_i4 <- "TreatmentAlmond:WeekWeek4"
+  b_i12 <- "TreatmentAlmond:WeekWeek12"
+  
+  needed <- c(b_trt, b_w4, b_w12, b_i4, b_i12)
+  
+  if (!all(needed %in% names(draws))) {
+    stop("Missing coefficients")
+  }
+  
+  out <- tibble::tibble(
+    ALM4_vs_ALM0 = draws[[b_w4]] + draws[[b_i4]],
+    
+    ALM12_vs_ALM0 = draws[[b_w12]] + draws[[b_i12]],
+    
+    ALM12_vs_ALM4 =
+      (draws[[b_w12]] - draws[[b_w4]]) +
+      (draws[[b_i12]] - draws[[b_i4]]),
+    
+    CRK4_vs_CRK0 = draws[[b_w4]],
+    
+    CRK12_vs_CRK0 = draws[[b_w12]],
+    
+    CRK12_vs_CRK4 =
+      draws[[b_w12]] - draws[[b_w4]],
+    
+    ALM0_vs_CRK0 = draws[[b_trt]],
+    
+    ALM4_vs_CRK4 =
+      draws[[b_trt]] + draws[[b_i4]],
+    
+    ALM12_vs_CRK12 =
+      draws[[b_trt]] + draws[[b_i12]]
+  )
+  
+  out %>%
+    tibble::rowid_to_column("draw_id") %>%
+    tidyr::pivot_longer(
+      cols = -draw_id,
+      names_to = "contrast",
+      values_to = ".draw"
+    )
+}
+
+
+# Function to calculate PD and ROPE
+compute_pd_rope <- function(
+    draws_df,
+    rope_low = log(0.9),
+    rope_high = log(1.1)
+) {
+  
+  draws_df %>%
+    group_by(contrast) %>%
+    summarise(
+      estimate = median(.draw),
+      conf.low = quantile(.draw, 0.025),
+      conf.high = quantile(.draw, 0.975),
+      
+      pd = max(
+        mean(.draw > 0),
+        mean(.draw < 0)
+      ),
+      
+      prop_in_rope =
+        mean(.draw >= rope_low & .draw <= rope_high),
+      
+      prop_outside_rope =
+        1 - prop_in_rope,
+      
+      .groups = "drop"
+    )
+}
+
+
+# Calculate PD and ROPE for reliable significant genera
+pd_rope_results <- bayes_results_clean %>%
+  filter(Genus %in% emm_sig_reliable$Genus) %>%
+  mutate(
+    draws = purrr::map(fit, get_contrast_draws)
+  ) %>%
+  dplyr::select(Genus, draws) %>%
+  tidyr::unnest(draws) %>%
+  group_by(Genus) %>%
+  group_modify(~ compute_pd_rope(.x)) %>%
+  ungroup()
+
+
+# Merge PD and ROPE with significant reliable contrasts
+bayes_final <- emm_sig_reliable %>%
+  dplyr::select(
+    Genus,
+    contrast,
+    estimate,
+    conf.low,
+    conf.high
+  ) %>%
+  left_join(
+    pd_rope_results %>%
+      dplyr::select(
+        Genus,
+        contrast,
+        pd,
+        prop_in_rope,
+        prop_outside_rope
+      ),
+    by = c("Genus", "contrast")
+  )
+
+
+# Classify results using PD and ROPE
+final_scored <- bayes_final %>%
+  mutate(
+    conclusion = case_when(
+      
+      pd >= 0.99 &
+        prop_in_rope < 0.05 ~
+        "Strong evidence of meaningful effect",
+      
+      pd >= 0.95 &
+        prop_in_rope < 0.20 ~
+        "Probable meaningful effect",
+      
+      pd >= 0.95 &
+        prop_in_rope >= 0.20 ~
+        "Probable direction, negligible magnitude",
+      
+      pd < 0.95 &
+        prop_in_rope < 0.20 ~
+        "Uncertain direction, meaningful if real",
+      
+      TRUE ~
+        "No evidence of meaningful effect"
+    )
+  )
+
+
+# Convert log-scale estimates to fold-change ratio
+final_scored <- final_scored %>%
+  mutate(
+    ratio = exp(estimate),
+    lo = exp(conf.low),
+    hi = exp(conf.high)
+  )
+
+
+# Save scored Bayesian results
+saveRDS(final_scored, "bayes_final_scored.rds")
+
+
+# Load and prepare genus abundance data
+ps_filtered <- readRDS("ps_filtered (2).rds")
+
+genus_df <- tax_glom(
+  ps_filtered,
+  taxrank = "Genus",
+  NArm = TRUE
+) %>%
+  ps_melt() %>%
+  mutate(
+    Sample = if_else(
+      Sample == "ALM105_5",
+      "ALM105_12",
+      Sample
+    ),
+    Treatment = factor(
+      Treatment,
+      levels = c("Cracker", "Almond")
+    ),
+    Week = factor(
+      Week,
+      levels = c(0, 4, 12),
+      labels = c("Week0", "Week4", "Week12")
+    ),
+    Subject = sub("_[^_]+$", "", Sample)
+  ) %>%
+  dplyr::select(-ID) %>%
+  group_by(Sample) %>%
+  mutate(
+    total = sum(Abundance)
+  ) %>%
+  ungroup()
+
+
+# Calculate relative abundance
+abundance_df <- genus_df %>%
+  mutate(
+    RelAbundance = Abundance / total
+  )
+
+
+# Calculate median relative abundance by group and time
+median_rel_abundance <- abundance_df %>%
+  group_by(Genus, Treatment, Week) %>%
+  summarise(
+    median_ref_abundance =
+      median(RelAbundance, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# Define reference group for each contrast
+ref_map <- tibble::tribble(
+  ~contrast,           ~Treatment, ~Week,
+  "ALM4_vs_ALM0",      "Almond",   "Week0",
+  "ALM12_vs_ALM0",     "Almond",   "Week0",
+  "ALM12_vs_ALM4",     "Almond",   "Week4",
+  "CRK4_vs_CRK0",      "Cracker",  "Week0",
+  "CRK12_vs_CRK0",     "Cracker",  "Week0",
+  "CRK12_vs_CRK4",     "Cracker",  "Week4",
+  "ALM0_vs_CRK0",      "Cracker",  "Week0",
+  "ALM4_vs_CRK4",      "Cracker",  "Week4",
+  "ALM12_vs_CRK12",    "Cracker",  "Week12"
+)
+
+
+# Add reference-group abundance to Bayesian results
+final_plot_df <- final_scored %>%
+  left_join(
+    ref_map,
+    by = "contrast"
+  ) %>%
+  left_join(
+    median_rel_abundance,
+    by = c("Genus", "Treatment", "Week")
+  ) %>%
+  mutate(
+    median_ref_abundance_pct =
+      median_ref_abundance * 100
+  )
+
+
+# Save final plotting data
+saveRDS(final_plot_df, "bayes_final_plot_data.rds")
+
+
+# Forest plot data for Almond Week12 vs Week0
+plot_df <- final_plot_df %>%
+  filter(
+    contrast == "ALM12_vs_ALM0",
+    conclusion %in% c(
+      "Strong evidence of meaningful effect",
+      "Probable meaningful effect"
+    )
+  ) %>%
+  mutate(
+    Genus = forcats::fct_reorder(Genus, ratio),
+    label = paste0(
+      round(median_ref_abundance_pct, 1),
+      "%"
+    )
+  )
+
+
+# Forest plot
+p_ALM12 <- ggplot(
+  plot_df,
+  aes(x = ratio, y = Genus)
+) +
+  
+  geom_vline(
+    xintercept = 1,
+    linetype = "dashed",
+    linewidth = 0.3
+  ) +
+  
+  geom_errorbar(
+    aes(
+      xmin = lo,
+      xmax = hi,
+      color = conclusion
+    ),
+    orientation = "y",
+    width = 0.25,
+    linewidth = 0.7
+  ) +
+  
+  geom_point(
+    aes(
+      size = median_ref_abundance_pct,
+      color = conclusion
+    ),
+    alpha = 0.9
+  ) +
+  
+  geom_text(
+    aes(
+      x = ratio,
+      label = label
+    ),
+    nudge_y = 0.3,
+    vjust = 0,
+    size = 3.5
+  ) +
+  
+  guides(
+    color = guide_legend(order = 1),
+    size = guide_legend(order = 2)
+  ) +
+  
+  scale_x_log10(
+    breaks = c(0.5, 1, 2, 3, 5),
+    labels = c("0.5", "1", "2", "3", "5"),
+    expand = expansion(mult = c(0.05, 0.15))
+  ) +
+  
+  scale_size_continuous(
+    range = c(2, 8),
+    name = "Median Relative Abundance (%)"
+  ) +
+  
+  scale_color_manual(
+    values = c(
+      "Strong evidence of meaningful effect" = "blue",
+      "Probable meaningful effect" = "firebrick"
+    ),
+    name = NULL
+  ) +
+  
+  labs(
+    x = "Fold change (95% Credible Interval)",
+    y = "Genus"
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.y = element_text(
+      size = 10,
+      face = "bold"
+    ),
+    axis.text.x = element_text(
+      size = 10,
+      face = "bold"
+    ),
+    axis.title.x = element_text(size = 8),
+    axis.title.y = element_text(size = 9),
+    panel.border = element_blank(),
+    axis.line = element_line(
+      color = "black",
+      linewidth = 0.1
+    ),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(
+      color = "grey88",
+      linewidth = 0.3
+    ),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(
+      size = 10,
+      face = "bold"
+    ),
+    legend.text = element_text(
+      size = 9,
+      face = "bold"
+    ),
+    plot.margin = margin(
+      5.5, 20, 5.5, 5.5
+    )
+  )
+
+print(p_ALM12)
+
+
+# Save forest plot
+cowplot::save_plot(
+  filename = "p_ALM12.png",
+  plot = p_ALM12,
+  base_width = 10,
+  base_height = 6,
+  dpi = 300
+)
+
+
+# Helper to prepare relative abundance data for boxplots
+make_halfmin_plot_data <- function(
+    df,
+    genera,
+    treatment_keep,
+    week_keep
+) {
+  
+  df %>%
+    filter(
+      Genus %in% genera,
+      Treatment %in% treatment_keep,
+      Week %in% week_keep
+    ) %>%
+    group_by(Genus) %>%
+    mutate(
+      min_nonzero = ifelse(
+        any(RelAbundance > 0, na.rm = TRUE),
+        min(
+          RelAbundance[RelAbundance > 0],
+          na.rm = TRUE
+        ),
+        NA_real_
+      ),
+      halfmin = min_nonzero / 2,
+      RelAbundance_plot = ifelse(
+        RelAbundance == 0,
+        halfmin,
+        RelAbundance
+      )
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(RelAbundance_plot))
+}
+
+
+# Taxa for Almond Week12 vs Week0 boxplot
+ALM12_vs_ALM0_genera <- final_scored %>%
+  filter(
+    contrast == "ALM12_vs_ALM0",
+    conclusion %in% c(
+      "Strong evidence of meaningful effect",
+      "Probable meaningful effect"
+    )
+  ) %>%
+  distinct(Genus) %>%
+  pull(Genus)
+
+
+# Prepare Almond Week12 vs Week0 boxplot data
+plot_data_ALM12_vs_ALM0 <- make_halfmin_plot_data(
+  df = abundance_df,
+  genera = ALM12_vs_ALM0_genera,
+  treatment_keep = "Almond",
+  week_keep = c("Week0", "Week12")
+)
+
+
+# Almond Week12 vs Week0 boxplot
+p_box_ALM12 <- ggplot(
+  plot_data_ALM12_vs_ALM0,
+  aes(
+    x = Week,
+    y = RelAbundance_plot,
+    fill = Week
+  )
+) +
+  
+  geom_boxplot(
+    alpha = 1,
+    outlier.shape = NA
+  ) +
+  
+  geom_point(
+    shape = 21,
+    size = 1.5,
+    stroke = 0.2,
+    position = position_jitter(width = 0.2)
+  ) +
+  
+  scale_y_log10() +
+  
+  facet_wrap(
+    ~ Genus,
+    scales = "free_y"
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Week0" = "skyblue",
+      "Week12" = "skyblue3"
+    )
+  ) +
+  
+  labs(
+    y = "Relative Abundance",
+    x = "Week",
+    title = "Almond Week12 vs Week0"
+  ) +
+  
+  theme_bw() +
+  theme(
+    strip.text = element_text(
+      size = 6,
+      face = "plain"
+    ),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      size = 8
+    ),
+    axis.text.y = element_text(size = 8),
+    axis.title = element_text(size = 10),
+    legend.position = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_box_ALM12)
+```
+
+
+
+
+
+
+
+
+
+
+# Get ASVs
+```{r}
+library(phyloseq)
+library(microViz)
+library(dplyr)
+
+# Extract taxonomy table
+tax_table_df <- as.data.frame(tax_table(ps_filtered))
+tax_table_df$ASV <- rownames(tax_table_df)
+
+
+
+# Get significant general list
+sig_genera_ALM12_CRK12 <- final_scored %>%
+  filter(contrast == "ALM12_vs_CRK12") %>%
+  pull(Genus) %>%
+  unique()
+
+# Filter ASVs belonging to significant genera
+asvs_in_ALM12_CRK12 <- tax_table_df %>%
+  filter(Genus %in% sig_genera_ALM12_CRK12)
+
+# How many ASVs per Genus
+asvs_in_ALM12_CRK12 %>%
+  count(Genus)
+
+
+# Extract Sequences for BLAST
+# Family XIII AD3011 group
+fam_asvs_ALM12_CRK12 <- asvs_in_ALM12_CRK12 %>% filter(Genus == "Family XIII AD3011 group")
+
+view(fam_asvs_ALM12_CRK12)
+
+# Extract ASV level abundance
+asv_melt <- ps_filtered %>%
+  ps_melt() %>%
+  mutate(
+    Treatment = factor(Treatment, levels = c("Cracker","Almond")),
+    Week      = factor(Week, levels = c(0,4,12), labels = c("Week0","Week4","Week12"))
+  )
+
+fam_asv_data <- asv_melt %>%
+  filter(Genus == "Family XIII AD3011 group")
+
+# Calculate mean abundance per ASV
+xyl_summary_w4 <- xyl_asv_data %>%
+  filter(Week == "Week4") %>%
+  group_by(OTU, Treatment) %>%
+  summarise(mean_abund = mean(Abundance),
+            .groups = "drop") %>%
+  pivot_wider(names_from = Treatment,
+              values_from = mean_abund,
+              values_fill = 0) %>%
+  mutate(
+    fold_change = (Almond + 1) / (Cracker + 1) 
+  ) %>%
+  arrange(desc(abs(log(fold_change))))
+
+
+# Check Contribution to genus abundance
+bact_total_contrib <- bact_asv_data %>%
+  group_by(OTU) %>%
+  summarise(total_abundance = sum(Abundance),
+            .groups = "drop") %>%
+  arrange(desc(total_abundance))
+
+
+# Rename OTU column for consistency
+bact_summary_w4_clean <- bact_summary_w4 %>%
+  rename(ASV = OTU)
+
+bact_total_contrib_clean <- bact_total_contrib %>%
+  rename(ASV = OTU)
+
+bact_master_table <- bact_asvs_ALM4_CRK4 %>%
+  left_join(bact_summary_w4_clean, by = "ASV") %>%
+  left_join(bact_total_contrib_clean, by = "ASV") %>%
+  arrange(desc(abs(log(fold_change))))
+
+
+```
+
+
+
+
+
+
+
+
+
+# ASV Level Diff On Selected Taxa
+```{r}
+# Libraries
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(glmmTMB)
+library(broom.mixed)
+library(emmeans)
+
+target_genera <- c("Bifidobacterium", "Roseburia", "Faecalibacterium", "Lachnospiraceae",
+                   "Phascolarctobacterium", "Tyzzerella", "Bacteroides","Lachnospira",
+                   "Ruminiclostridium","Ruminococcus","Phocaeicola","Dorea",
+                   "Lactobacillus","Dialister","Clostridium", "Lacrimispora","Blautia",
+                   "Collinsella", "Monoglobus", " Eubacterium", "Oscillospira")
+
+
+# Filter Phyloseq Object to target genera
+target_ps <- ps_filtered %>% subset_taxa(Genus %in% target_genera)
+
+# Melte phyloseq to long format
+melted_asv <- ps_melt(target_ps)
+
+# Set Treatment and Week Baseline levels
+melted_asv <- melted_asv %>%
+  dplyr::select(-ID, dplyr::everything()) %>% 
+  mutate(
+    Treatment = factor(Treatment, levels = c("Cracker", "Almond")),
+    Week      = factor(Week,
+                       levels = c(0, 4, 12),
+                       labels = c("Week0", "Week4", "Week12"))
+  ) %>%
+  # add total counts per sample
+  group_by(Sample) %>%
+  mutate(total = sum(Abundance)) %>%
+  ungroup()
+
+# Define a Function to run NB
+glmm_asv_nb <- function(df) {
+  glmmTMB(
+    Abundance ~ Treatment * Week + (1 | Sample),
+    family = nbinom2,
+    data   = df,
+    offset = log(total)
+  )
+}
+
+# safe version
+safe_nb <- purrr::possibly(glmm_asv_nb, otherwise = NULL)
+
+View(melted_asv)
+
+# fit one model per ASV
+glmm_asv<- melted_asv %>%
+  group_by(Genus, OTU) %>%
+  nest(data = -c(Genus, OTU)) %>%
+         ungroup() %>%
+  mutate(
+    fit = purrr::map(data, safe_nb)
+  ) %>%
+  filter(!purrr::map_lgl(fit, is.null))
+
+glmm_asv_tidy <- glmm_asv %>%
+  mutate(
+    tidied = purrr::map(fit, ~ broom.mixed::tidy(.x, effects = "fixed"))
+  ) %>%
+  tidyr::unnest(tidied)
+
+
+asv_tidy <- glmm_asv %>%
+  mutate(
+    tidied = purrr::map(
+      fit, ~ broom.mixed::tidy(.x, effects = "fixed")
+    )
+  ) %>%
+  tidyr::unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  filter(
+    is.finite(estimate),
+    !is.na(p.value),
+    abs(estimate) < 100
+  ) %>%
+  mutate(
+    p.adj = p.adjust(p.value, method = "fdr")
+  )
+
+
+# Get the raw orders
+emmeans(glmm_asv$fit[[1]], ~ Treatment * Week) %>%
+  as.data.frame() %>%
+  dplyr::select(Treatment, Week)
+
+
+# Apply Emmeans based on Costume Contrasts
+emmeans_asv <- function(model) {
+  tryCatch({
+    emmeans(model, ~ Treatment * Week) %>%
+      contrast(method = list(
+        "ALM4_vs_ALM0"   = c(0, -1, 0,  1, 0, 0),
+        "ALM12_vs_ALM0"  = c(0, -1, 0,  0, 0, 1),
+        "ALM12_vs_ALM4"  = c(0,  0, 0, -1, 0, 1),
+        "CRK4_vs_CRK0"   = c(-1, 0, 1,  0, 0, 0),
+        "CRK12_vs_CRK0"  = c(-1, 0, 0,  0, 1, 0),
+        "CRK12_vs_CRK4"  = c(0,  0,-1,  0, 1, 0),
+        "ALM0_vs_CRK0"   = c(-1, 1, 0,  0, 0, 0),
+        "ALM4_vs_CRK4"   = c(0,  0,-1,  1, 0, 0),
+        "ALM12_vs_CRK12" = c(0,  0, 0,  0,-1, 1)
+      )) %>%
+      broom::tidy()
+  }, error = function(e) NULL)
+}
+
+
+interaction_emms_asv <- glmm_asv %>%
+  mutate(emms = purrr::map(fit, emmeans_asv)) %>%
+  filter(!purrr::map_lgl(emms, is.null)) %>%
+  unnest(emms) %>%
+  rename(contrast = contrast) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+# Sig Results Only
+sig_asv <- interaction_emms_asv %>%
+  filter(p.adj < 0.10)
+
+view(sig_asv)
+
+view(interaction_emms_asv)
+
+
+
+# bky adjustment
+interaction_emms_asv <- glmm_asv %>%
+  mutate(
+    emms_interaction = purrr::map(fit, ~ emmeans_asv(.x))
+  ) %>% 
+  dplyr::select(Genus, emms_interaction) %>%
+  tidyr::unnest(emms_interaction) %>%
+  mutate(
+    p.adj_bky = cp4p::adjust.p(p.value, pi0.method = "bky", alpha = 0.1)$adjp[,2]
+  )
+
+bky_asv <- interaction_emms_asv %>%
+  filter(p.adj_bky < 0.1)
+view(bky_asv)
+
+
+```
+
+
+
+
+
+
+
+
+# Partial Correlation Analysis, Almond Only
+```{r}
+# Load libraries
+
+library(phyloseq)
+library(microbiome)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(broom)
+library(purrr)
+library(pheatmap)
+library(ppcor)
+library(cowplot)
+library(viridis)
+
+
+# Prepare phyloseq and metadata
+
+# Phyloseq object
+ps_n <- ps_filtered
+
+# Correct sample name
+sample_names(ps_n)[sample_names(ps_n) == "ALM105_5"] <- "ALM105_12"
+
+# Read metadata
+metadata <- read.csv(
+  "Biomarker_Metadata.csv",
+  stringsAsFactors = FALSE
+)
+
+
+# Rename Subject column to ID
+colnames(metadata)[colnames(metadata) == "Subject"] <- "ID"
+
+# Set row names of metadata
+rownames(metadata) <- metadata$ID
+
+# Reorder metadata to match phyloseq sample order
+metadata <- metadata[
+  sample_names(ps_n),,
+  drop = FALSE]
+
+
+# Replace metadata in phyloseq object
+sample_data(ps_n) <- sample_data(metadata)
+
+
+id_col <- "ID"
+week_col <- "Week"
+
+
+# Aggregate at genus level
+ps_genera <- microbiome::aggregate_taxa(
+  ps_n,
+  level = "Genus")
+
+# Subset Phyloseq object to almond group
+almond_ids <- as(sample_data(ps_n), "data.frame") %>%
+  dplyr::filter(Treatment == 1) %>%
+  dplyr::pull(ID)
+
+
+# Subset full phyloseq object
+ps_almond <- prune_samples(
+  almond_ids,
+  ps_n
+)
+
+
+# Aggregate Almond object at genus level
+ps_almond_ag <- microbiome::aggregate_taxa(
+  ps_almond,
+  level = "Genus"
+)
+
+
+# Confirm Almond-only object
+table(as(sample_data(ps_almond_ag), "data.frame")$Treatment)
+
+
+### Week4
+
+# Split significant genera based on contrasts
+sig_Almond_4 <- final_scored %>%
+  dplyr::filter(contrast %in% c( "ALM4_vs_ALM0", "ALM4_vs_CRK4" )
+  ) %>%
+  dplyr::pull(Genus) %>%
+  unique()
+
+# Subset Almond phyloseq object to Week 4
+week4_ids <- grep("_4$",sample_names(ps_almond_ag),value = TRUE)
+
+ps_almond_4 <- prune_samples(week4_ids,ps_almond_ag)
+
+
+# Confirm one Week 4 sample per subject
+subject_4 <- sub( "_(0|4|12)$", "", sample_names(ps_almond_4))
+
+
+stopifnot(
+  anyDuplicated(subject_4) == 0
+)
+
+
+# Extarct significant genera and do clr transformation
+
+# Subset phyloseq object for significant genera
+ps_siga_4 <- subset_taxa(ps_almond_4,Genus %in% sig_Almond_4)
+
+
+# CLR transformation
+ps_clra_4 <- microbiome::transform(ps_siga_4,"clr")
+
+
+# Extract CLR-transformed abundance table
+clr_abundance_4 <- otu_table(ps_clra_4)
+
+
+if (taxa_are_rows(ps_clra_4)) {
+  clr_abundance_4 <- t(clr_abundance_4)
+}
+
+
+# Convert to data frame
+clr_abundance_4 <- as.data.frame(clr_abundance_4)
+
+
+# Extract week4 biomarker delta values
+delta_all_4 <- as(sample_data(ps_almond_4), "data.frame") %>%
+  dplyr::select(ends_with("d4")) %>%
+  dplyr::select( -matches( "Acetic_d4|Propionic_d4|Butyric_d4|Valeric_d4|Lactic_d4|SCFAs_d4"
+    ))
+
+
+# Mean-impute missing Calprotectin_d4 values
+delta_all_4$Calprotectin_d4[is.na(delta_all_4$Calprotectin_d4)] <- mean(
+  delta_all_4$Calprotectin_d4,na.rm = TRUE)
+
+# Sign log transformation function
+log_transform <- function(x) sign(x) * log1p(abs(x))
+
+# Log-transform delta values 
+delta_all_4 <- delta_all_4 %>%
+  mutate(across(everything(),log_transform))
+
+
+# Match taxa and biomarker rows
+samples_all_4 <- intersect(rownames(clr_abundance_4), rownames(delta_all_4))
+
+
+clr_matched_4 <- clr_abundance_4[samples_all_4,,drop = FALSE]
+
+delta4_all_matched <- delta_all_4[
+  samples_all_4,,drop = FALSE]
+
+
+# Week 4 confounders
+df_meta_4 <- as(sample_data(ps_almond_4),"data.frame")
+
+
+confounders_4 <- df_meta_4[,c("Age", "Sex", "BMI"),drop = FALSE]
+
+# Recode sex
+confounders_4$Sex_recoded <- dplyr::recode(
+  confounders_4$Sex,
+  "NonBinary" = "F",
+  "Transgender" = "M",
+  .default = confounders_4$Sex)
+
+
+confounders_4$Sex_num <- ifelse(confounders_4$Sex_recoded == "M",1,0)
+
+
+confounder_4 <- data.frame(
+  Age = as.numeric(confounders_4$Age),
+  Sex_num = as.numeric(confounders_4$Sex_num),
+  BMI = as.numeric(confounders_4$BMI),
+  row.names = rownames(confounders_4)
+)
+
+
+# Align all objects
+samps_4 <- Reduce(intersect,list(
+    rownames(clr_matched_4),
+    rownames(delta4_all_matched),
+    rownames(confounder_4)
+  ))
+
+
+clr_matched_4 <- clr_matched_4[samps_4,, drop = FALSE]
+
+
+delta4_all_matched <- delta4_all_matched[samps_4,, drop = FALSE]
+
+
+confounder_4 <- confounder_4[samps_4,,drop = FALSE]
+
+
+# Confirm exact alignment
+stopifnot(
+  identical(
+    rownames(clr_matched_4),
+    rownames(delta4_all_matched)
+  ),
+  identical(
+    rownames(clr_matched_4),
+    rownames(confounder_4)
+  )
+)
+
+
+c(CLR_samples = nrow(clr_matched_4),Biomarker_samples = nrow(delta4_all_matched),
+  Confounder_samples = nrow(confounder_4))
+
+
+# Build Week 4 genus-biomarker pairs
+genus_biom_4 <- tidyr::expand_grid(
+  Genus = colnames(clr_matched_4),
+  Biomarker = colnames(delta4_all_matched))
+
+
+# Partial correlation function
+partial_cor_4 <- function(genus, biomarker) {
+  x <- clr_matched_4[[genus]]
+  y <- delta4_all_matched[[biomarker]]
+  tt <- ppcor::pcor.test(x,y,z = as.matrix(confounder_4), method = "spearman")
+  tibble::tibble(Genus = genus,Biomarker = biomarker,r = unname(tt$estimate),
+    p = unname(tt$p.value))}
+
+
+# Run Correlation with P adjustment
+alpha <- 0.10
+
+results_p4 <- purrr::pmap_dfr(genus_biom_4,~ partial_cor_4(..1, ..2)) %>%
+  dplyr::mutate(q_bh_global = p.adjust(p,method = "fdr"))
+
+
+# Filter significant correlations
+results_sig4_bh <- results_p4 %>%
+  dplyr::filter(q_bh_global < alpha) %>% dplyr::arrange(q_bh_global)
+
+
+### Week 12
+# Split significant genera based on contrasts
+sig_Almond_12 <- final_scored %>% 
+  dplyr::filter( contrast %in% c("ALM12_vs_ALM0","ALM12_vs_CRK12")
+  ) %>%
+  dplyr::pull(Genus) %>%
+  unique()
+
+
+# Subset Almond phyloseq object to Week 12
+week12_ids <- grep( "_12$",sample_names(ps_almond_ag),value = TRUE)
+
+
+ps_almond_12 <- prune_samples(
+  week12_ids, ps_almond_ag)
+
+# Confirm one Week 12 sample per subject
+subject_12 <- sub("_(0|4|12)$","", sample_names(ps_almond_12))
+
+
+stopifnot(anyDuplicated(subject_12) == 0)
+
+
+# Select significant genera and perform cl transformation
+ps_siga_12 <- subset_taxa(ps_almond_12,Genus %in% sig_Almond_12)
+
+ps_clra_12 <- microbiome::transform(ps_siga_12,"clr")
+
+
+# Extract CLR-transformed abundance table
+clr_abundance_12 <- otu_table(ps_clra_12)
+
+if (taxa_are_rows(ps_clra_12)) {
+  clr_abundance_12 <- t(clr_abundance_12)
+}
+
+
+# Convert to data frame
+clr_abundance_12 <- as.data.frame(clr_abundance_12)
+
+
+
+# Extract Week 12 biomarker delta values
+delta_all_12 <- as(sample_data(ps_almond_12), "data.frame") %>%
+  dplyr::select(ends_with("d12")) %>%
+  dplyr::select(
+    -matches(
+      "Acetic_d12|Propionic_d12|Butyric_d12|Valeric_d12|Lactic_d12|SCFAs_d12"
+    )
+  )
+
+
+# Mean-impute missing Calprotectin_d12 values
+delta_all_12$Calprotectin_d12[
+  is.na(delta_all_12$Calprotectin_d12)
+] <- mean(
+  delta_all_12$Calprotectin_d12,
+  na.rm = TRUE
+)
+
+
+# Apply the same transformation used for Week 4
+delta_all_12 <- delta_all_12 %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::everything(),
+      log_transform
+    )
+  )
+
+
+# Match Week 12 CLR and biomarker rows
+samples_all_12 <- intersect(
+  rownames(clr_abundance_12),
+  rownames(delta_all_12))
+
+clr_matched_12 <- clr_abundance_12[samples_all_12,,drop = FALSE]
+
+
+delta12_all_matched <- delta_all_12[samples_all_12,,drop = FALSE]
+
+
+
+# Build Week 12 confounders
+df_meta_12 <- as(sample_data(ps_almond_12),"data.frame")
+
+confounders_12 <- df_meta_12[,c("Age", "Sex", "BMI"),drop = FALSE]
+
+
+# Recode sex
+confounders_12$Sex_recoded <- dplyr::recode(confounders_12$Sex,
+  "NonBinary" = "F",
+  "Transgender" = "M",
+  .default = confounders_12$Sex)
+
+
+confounders_12$Sex_num <- ifelse(confounders_12$Sex_recoded == "M",1,0)
+
+
+confounder_12 <- data.frame(
+  Age = as.numeric(confounders_12$Age),
+  Sex_num = as.numeric(confounders_12$Sex_num),
+  BMI = as.numeric(confounders_12$BMI),
+  row.names = rownames(confounders_12))
+
+
+# Align all thre objects together
+samps_12 <- Reduce(intersect,
+  list(
+    rownames(clr_matched_12),
+    rownames(delta12_all_matched),
+    rownames(confounder_12)))
+
+
+stopifnot(
+  length(samps_12) > 0)
+
+
+clr_matched_12 <- clr_matched_12[samps_12,,drop = FALSE]
+
+
+delta12_all_matched <- delta12_all_matched[samps_12,,drop = FALSE]
+
+
+confounder_12 <- confounder_12[samps_12,,drop = FALSE]
+
+
+# Confirm exact alignment
+stopifnot(
+  identical(
+    rownames(clr_matched_12),
+    rownames(delta12_all_matched)
+  ),
+  identical(
+    rownames(clr_matched_12),
+    rownames(confounder_12)
+  )
+)
+
+
+c(CLR_samples = nrow(clr_matched_12),
+Biomarker_samples = nrow(delta12_all_matched),
+Confounder_samples = nrow(confounder_12))
+
+
+# Build Week 12 genus-biomarker pairs
+genus_biom_12 <- tidyr::expand_grid(
+  Genus = colnames(clr_matched_12),
+  Biomarker = colnames(delta12_all_matched))
+
+
+
+# Define Week 12 correlation function
+partial_cor_12 <- function(genus, biomarker) {
+  x <- clr_matched_12[[genus]]
+  y <- delta12_all_matched[[biomarker]]
+  tt <- ppcor::pcor.test(
+    x,
+    y,
+    z = as.matrix(confounder_12),
+    method = "spearman")
+
+  tibble::tibble(
+    Genus = genus,
+    Biomarker = biomarker,
+    r = unname(tt$estimate),
+    p = unname(tt$p.value))}
+
+
+# Run Week 12 correlations and BH adjustment
+results_p12 <- purrr::pmap_dfr(genus_biom_12,~ partial_cor_12(..1, ..2))%>%
+  dplyr::mutate(q_bh_global = p.adjust(p,method = "fdr"))
+
+
+# Filter significant correlations
+results_sig12_bh <- results_p12 %>%dplyr::filter(q_bh_global < alpha
+  ) %>% dplyr::arrange(q_bh_global)
+
+
+
+### Plot ----------------------------------------------------------------------
+
+# Prepare data for heatmap
+mk_star <- function(df, qcol, alpha = 0.10) {
+  df %>%
+    dplyr::mutate(
+      star = ifelse(
+        .data[[qcol]] < alpha,
+        "*",
+        "")) %>%
+    dplyr::select(Genus,Biomarker,star) %>%
+    tidyr::pivot_wider(names_from = Biomarker,values_from = star) %>%
+    tibble::column_to_rownames("Genus") %>%
+    as.matrix() %>%
+    t()}
+
+
+# Biomarker order for plot
+biomarker_order <- c("FBG","Insulin","TG","Total.C","LDL.C","HDL","WC","SBP",
+  "DBP","Calprotectin","MDA","aT.Chol","aCHC.C")
+
+
+biomarker_labels <- c(
+  "FBG" = "Fasting Blood Glucose",
+  "Insulin" = "Insulin",
+  "TG" = "Triglycerides",
+  "Total.C" = "Total Cholesterol",
+  "LDL.C" = "LDL Cholesterol",
+  "HDL" = "HDL Cholesterol",
+  "WC" = "Waist Circumference",
+  "SBP" = "Systolic Blood Pressure",
+  "DBP" = "Diastolic Blood Pressure",
+  "Calprotectin" = "Calprotectin",
+  "MDA" = "Malondialdehyde",
+  "aT.Chol" = "α-Tocopherol",
+  "aCHC.C" = "α-CEHC"
+)
+
+
+corr_matrix_12 <- results_p12 %>%
+  dplyr::select(Genus,Biomarker, r) %>%
+  tidyr::pivot_wider( names_from = Biomarker,values_from = r) %>%
+  tibble::column_to_rownames("Genus") %>%
+  as.matrix()
+
+# Transpose so biomarkers are rows
+corr_matrix_t12 <- t(corr_matrix_12)
+
+# Clean row names
+rownames(corr_matrix_t12) <- gsub("_d12$", "",rownames(corr_matrix_t12))
+
+
+# Build significance-star matrix
+star_bh_t12 <- mk_star(results_p12,"q_bh_global",alpha = 0.10)
+
+
+rownames(star_bh_t12) <- gsub("_d12$","", rownames(star_bh_t12))
+
+
+# Reorder biomarkers 
+biomarker_order_12 <- biomarker_order[biomarker_order %in% rownames(corr_matrix_t12)]
+
+corr_matrix_t12 <- corr_matrix_t12[biomarker_order_12,, drop = FALSE]
+
+star_bh_t12 <- star_bh_t12[biomarker_order_12,, drop = FALSE]
+
+
+# Rename rows with full biomarker labels
+rownames(corr_matrix_t12) <- biomarker_labels[rownames(corr_matrix_t12)]
+
+rownames(star_bh_t12) <- biomarker_labels[rownames(star_bh_t12)]
+
+
+# Plot Week 12 heatmap
+pheatmap(
+  corr_matrix_t12,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  color = viridis(100),
+  display_numbers = star_bh_t12,
+  fontsize_row = 7,
+  fontsize_col = 8,
+  fontsize_number = 10,
+  number_color = "white",
+  cellwidth = 25,
+  cellheight = 10,
+  border_color = "grey90",
+  filename = "BiomCor_w12.png",
+  width = 9,
+  height = 6
+)
+
+
+
+#### Scatter Plots of Significant pairs
+
+
+# Positive Correlations---------------------------------------------------------
+
+plot_df <- data.frame(
+  Taxa = clr_matched_12[["Lachnospira"]],
+  Biomarker = delta12_all_matched[["Calprotectin_d12"]]
+)
+
+p3 <- ggplot(plot_df, aes(x = Taxa, y = Biomarker)) +
+  geom_point(
+    size = 3,
+    color = "forestgreen"
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    color = "forestgreen",
+    fill = "forestgreen",
+    alpha = 0.20
+  ) +
+  labs(
+    title = "Lachnospira vs Calprotectin"
+  ) +
+  theme_bw() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 13),
+    axis.text.y = element_text(size = 13),
+    plot.title = element_text(size = 15)
+  )
+
+p3
+
+# Negative Correlations---------------------------------------------------------
+
+plot_df <- data.frame(
+  Taxa = clr_matched_12[["Erysipelotrichaceae UCG-003"]],
+  Biomarker = delta12_all_matched[["Calprotectin_d12"]]
+)
+
+p5 <- ggplot(plot_df, aes(x = Taxa, y = Biomarker)) +
+  geom_point(
+    size = 3,
+    color = "firebrick2"
+  ) +
+  geom_smooth(
+    method = "lm",
+    se = TRUE,
+    color = "firebrick2",
+    fill = "firebrick2",
+    alpha = 0.20
+  ) +
+  labs(
+    title = "Erysipelotrichaceae UCG-003 vs Calprotectin"
+  ) +
+  theme_bw() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(size = 13),
+    axis.text.y = element_text(size = 13),
+    plot.title = element_text(size = 15)
+  )
+
+p5
+
+```
+
+
+
+
+
+# Responder, NonResponder based on different Biomarkers
+```{r}
+# Load Libraries
+library(phyloseq)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+
+# Read  metadata
+metadata <- read.csv("Biomarker_Metadata.csv", stringsAsFactors = FALSE)
+
+## LDL_C
+# Prepare data
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+ldl_col <- "LDL.C"
+delta_col <- "LDL.C_d12"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to one row
+subj_tab <- almond_meta %>% arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(trt_col)),
+    LDL.C_d12 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+ 
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & LDL.C_d12 <= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_5 = ifelse(Treatment == 1 & LDL.C_d12 <= 0.05, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_10 = ifelse(Treatment == 1 & LDL.C_d12 <= 0.1, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+
+# Build subject level baseline LDL (% of changes from baseline)
+ldl_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(ldl_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 12)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, LDL = !!sym(ldl_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = LDL, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk12 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+# Remove the outlier
+out_ctrl <- c("ALM099")
+ldl_clean <- ldl_wide %>%
+  filter(!(Treatment == 0 & Subject %in% out_ctrl))
+
+
+almond_labels <- ldl_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_10 = ifelse(pct_delta <= -0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_16 = ifelse(pct_delta <= -0.16, "Responder", "NonResponder"),
+    resp_17 = ifelse(pct_delta <= -0.17, "Responder", "NonResponder"),
+    resp_18 = ifelse(pct_delta <= -0.18, "Responder", "NonResponder"),
+    resp_19 = ifelse(pct_delta <= -0.19, "Responder", "NonResponder"),)
+
+
+cracker_labels <- ldl_clean %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_10 = ifelse(pct_delta <= -0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_16 = ifelse(pct_delta <= -0.16, "Responder", "NonResponder"),
+    resp_17 = ifelse(pct_delta <= -0.17, "Responder", "NonResponder"),
+    resp_18 = ifelse(pct_delta <= -0.18, "Responder", "NonResponder"),
+    resp_19 = ifelse(pct_delta <= -0.19, "Responder", "NonResponder"),)
+
+
+
+## Total Cholestrol
+
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+tc_col <- "Total.C"
+delta_col <- "Total.C_d12"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(trt_col)),
+    Total.C_d12 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & Total.C_d12 <= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_5 = ifelse(Treatment == 1 & Total.C_d12 <= 0.05, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_10 = ifelse(Treatment == 1 & Total.C_d12 <= 0.1, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+# Build subject level baseline Total Cholesterol (% of changes from baseline)
+tc_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(tc_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 12)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, TC = !!sym(tc_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = TC, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk12 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+# Remove the outlier
+out_ctrl <- c("ALM099")
+tc_clean <- tc_wide %>% filter(!(Treatment == 0 & Subject %in% out_ctrl))
+
+
+
+almont_labels <- tc_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_10 = ifelse(pct_delta <= -0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_16 = ifelse(pct_delta <= -0.16, "Responder", "NonResponder"),
+    resp_17 = ifelse(pct_delta <= -0.17, "Responder", "NonResponder"),
+    resp_18 = ifelse(pct_delta <= -0.18, "Responder", "NonResponder"),
+    resp_19 = ifelse(pct_delta <= -0.19, "Responder", "NonResponder"),
+  )
+
+
+cracket_labels <- tc_clean %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_10 = ifelse(pct_delta <= -0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_16 = ifelse(pct_delta <= -0.16, "Responder", "NonResponder"),
+    resp_17 = ifelse(pct_delta <= -0.17, "Responder", "NonResponder"),
+    resp_18 = ifelse(pct_delta <= -0.18, "Responder", "NonResponder"),
+    resp_19 = ifelse(pct_delta <= -0.19, "Responder", "NonResponder"),
+  )
+
+
+#### Waist Circumference
+# Week 4
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+wc_col <- "WC"
+delta_col <- "WC_d4"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(trt_col)),
+    WC_d4 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & WC_d4 <= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_1 = ifelse(Treatment == 1 & WC_d4 <= 0.01, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_2 = ifelse(Treatment == 1 & WC_d4 <= 0.02, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+
+
+# Build subject level baseline WC (% of changes from baseline)
+wc_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(wc_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 4)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, WC = !!sym(wc_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = WC, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk4 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+
+almonw_labels <- wc_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_1  = ifelse(pct_delta <= -0.01, "Responder", "NonResponder"),
+    resp_2  = ifelse(pct_delta <= -0.02, "Responder", "NonResponder"),
+    resp_3 = ifelse(pct_delta <= -0.03, "Responder", "NonResponder"),
+    resp_4 = ifelse(pct_delta <= -0.04, "Responder", "NonResponder"),
+    resp_5 = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_6 = ifelse(pct_delta <= -0.06, "Responder", "NonResponder"),
+    resp_7 = ifelse(pct_delta <= -0.07, "Responder", "NonResponder"),
+    resp_8 = ifelse(pct_delta <= -0.08, "Responder", "NonResponder"),)
+
+
+crackew_labels <- wc_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_1  = ifelse(pct_delta <= -0.01, "Responder", "NonResponder"),
+    resp_2  = ifelse(pct_delta <= -0.02, "Responder", "NonResponder"),
+    resp_3 = ifelse(pct_delta <= -0.03, "Responder", "NonResponder"),
+    resp_4 = ifelse(pct_delta <= -0.04, "Responder", "NonResponder"),
+    resp_5 = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_6 = ifelse(pct_delta <= -0.06, "Responder", "NonResponder"),
+    resp_7 = ifelse(pct_delta <= -0.07, "Responder", "NonResponder"),
+    resp_8 = ifelse(pct_delta <= -0.08, "Responder", "NonResponder"),
+  )
+
+
+
+## WC_d12----------------------------------------------------------------------
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+wc_col <- "WC"
+delta_col <- "WC_d12"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to 1 row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(trt_col)),
+    WC_d12 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & WC_d12 <= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_1 = ifelse(Treatment == 1 & WC_d12 <= 0.01, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_2 = ifelse(Treatment == 1 & WC_d12 <= 0.02, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+# Build subject level baseline WC (% of changes from baseline)
+wc_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(wc_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 12)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, WC = !!sym(wc_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = WC, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk12 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+almonw_labels <- wc_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_1  = ifelse(pct_delta <= -0.01, "Responder", "NonResponder"),
+    resp_2  = ifelse(pct_delta <= -0.02, "Responder", "NonResponder"),
+    resp_3 = ifelse(pct_delta <= -0.03, "Responder", "NonResponder"),
+    resp_4 = ifelse(pct_delta <= -0.04, "Responder", "NonResponder"),
+    resp_5 = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_6 = ifelse(pct_delta <= -0.06, "Responder", "NonResponder"),
+    resp_7 = ifelse(pct_delta <= -0.07, "Responder", "NonResponder"),
+    resp_8 = ifelse(pct_delta <= -0.08, "Responder", "NonResponder"),)
+
+
+crackew_labels <- wc_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_1  = ifelse(pct_delta <= -0.01, "Responder", "NonResponder"),
+    resp_2  = ifelse(pct_delta <= -0.02, "Responder", "NonResponder"),
+    resp_3 = ifelse(pct_delta <= -0.03, "Responder", "NonResponder"),
+    resp_4 = ifelse(pct_delta <= -0.04, "Responder", "NonResponder"),
+    resp_5 = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_6 = ifelse(pct_delta <= -0.06, "Responder", "NonResponder"),
+    resp_7 = ifelse(pct_delta <= -0.07, "Responder", "NonResponder"),
+    resp_8 = ifelse(pct_delta <= -0.08, "Responder", "NonResponder"),)
+
+
+
+## Calprotectin-----------------------------------------------------------------
+# Week 4
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+cal_col <- "Calprotectin"
+delta_col <- "Calprotectin_d4"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(trt_col)),
+    Calprotectin_d4 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & Calprotectin_d4 <= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_20 = ifelse(Treatment == 1 & Calprotectin_d4 <= 0.2, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_25 = ifelse(Treatment == 1 & Calprotectin_d4 <= 0.25, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+# Build subject level baseline Calprotectin (% of changes from baseline)
+cal_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(cal_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 4)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, CAL = !!sym(cal_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = CAL, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk4 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+# Remove missing
+out_alm <- c("ALM022")
+cal_clean <- cal_wide %>%
+  filter(!(Treatment == 1 & Subject %in% out_alm))
+
+
+alcal_labels <- cal_clean %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_15  = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta <= -0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta <= -0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder"),
+  )
+
+cracal_labels <- cal_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_15  = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta <= -0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta <= -0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder"),
+  )
+
+
+# Week 12
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+cal_col <- "Calprotectin"
+delta_col <- "Calprotectin_d12"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(trt_col)),
+    Calprotectin_d12 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & Calprotectin_d12 <= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_20 = ifelse(Treatment == 1 & Calprotectin_d12 <= 0.2, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_25 = ifelse(Treatment == 1 & Calprotectin_d12 <= 0.25, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+# Build subject level baseline Calprotectin (% of changes from baseline)
+cal_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(cal_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 12)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, CAL = !!sym(cal_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = CAL, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk12 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+
+# Remove missing
+out_alm <- c("ALM022")
+cal_clean <- cal_wide %>%
+  filter(!(Treatment == 1 & Subject %in% out_alm))
+
+
+alcal_labels <- cal_clean %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_15  = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta <= -0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta <= -0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder"),
+  )
+
+
+cracal_labels <- cal_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_15  = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta <= -0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta <= -0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder"),
+  )
+
+
+## Calprotectin on participants with inflammation at baselin-------------------
+# Week 4
+# Inflamed subjects Combined List(34)
+inflammed_ids <- c(
+  "ALM059","ALM066","ALM084","ALM091","ALM094","ALM098","ALM099","ALM087",
+  "ALM107","ALM113","ALM120","ALM129","ALM140","ALM153","ALM177","ALM004",
+  "ALM015","ALM027","ALM001","ALM006","ALM065","ALM090","ALM103","ALM126",
+  "ALM156","ALM171","ALM179","ALM072","ALM046","ALM102","ALM139","ALM031",
+  "ALM045","ALM112")
+
+# Inflamed Based on Calprotectin (27)
+inflamed_cal <- c(
+  "ALM059","ALM066","ALM084","ALM091","ALM094","ALM098","ALM099","ALM087",
+  "ALM107","ALM113","ALM120","ALM129","ALM140","ALM153","ALM177","ALM004",
+  "ALM015","ALM027","ALM001","ALM006","ALM065","ALM090","ALM103","ALM126",
+  "ALM156","ALM171","ALM179")
+
+# Inflamed Based on MPO (24)
+inflamed_mpo <- c( "ALM059","ALM084","ALM098","ALM099","ALM087","ALM107","ALM113","ALM120","ALM140","ALM004","ALM027","ALM001","ALM006","ALM060","ALM090","ALM103","ALM179","ALM072","ALM046","ALM102","ALM139","ALM031", "ALM045","ALM112")
+
+
+# Inflamed based on Both (16)
+inflamed_both <- c("ALM059", "ALM084", "ALM098", "ALM099", "ALM087", "ALM107", 
+                   "ALM113", "ALM120", "ALM140", "ALM004", "ALM027", "ALM001",
+                   "ALM006", "ALM090", "ALM103", "ALM179")
+
+
+##  Basic column names 
+id_col    <- "ID"
+week_col  <- "Week"
+trt_col   <- "Treatment"
+cal_col   <- "Calprotectin"
+delta_col <- "Calprotectin_d4"
+
+# Extract metadata and create Subject 
+
+almond_meta <- as(sample_data(ps_n), "data.frame") %>%
+  mutate(
+    Subject = str_replace(!!sym(id_col), "_(0|4|12)$", ""))
+
+# Wide table of calprotectin (wk0 & wk4) and % change 
+
+cal_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(cal_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 4)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, CAL = !!sym(cal_col)) %>%
+  pivot_wider(names_from = Week, values_from = CAL, names_prefix = "wk") %>%
+  mutate(
+    pct_delta         = (wk4 - wk0) / wk0,          
+    pct_delta_percent = pct_delta * 100 )
+
+#Restrict to inflamed subjects 
+
+cal_inf <- cal_wide %>%
+  filter(Subject %in% inflamed_both)
+
+# Optionally remove missing subject 
+out_alm <- "ALM022"
+cal_inf <- cal_inf %>%
+  filter(Subject != out_alm)
+
+
+# Define responder / non-responder labels in inflamed subjects
+
+# Almond arm only (inflamed)
+almond_inflm <- cal_inf %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder","NonResponder"),
+    resp_15      = ifelse(pct_delta <= -0.15,        "Responder","NonResponder"),
+    resp_20      = ifelse(pct_delta <= -0.20,        "Responder","NonResponder"),
+    resp_25      = ifelse(pct_delta <= -0.25,        "Responder","NonResponder"),
+    resp_30      = ifelse(pct_delta <= -0.30,        "Responder","NonResponder"),
+    resp_35      = ifelse(pct_delta <= -0.35,        "Responder","NonResponder"),
+    resp_40      = ifelse(pct_delta <= -0.40,        "Responder","NonResponder"),
+    resp_45      = ifelse(pct_delta <= -0.45,        "Responder","NonResponder"),
+    resp_50      = ifelse(pct_delta <= -0.50,        "Responder","NonResponder"))
+
+# Cracker arm only (inflamed)
+cracker_inflm <- cal_inf %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder","NonResponder"),
+    resp_15      = ifelse(pct_delta <= -0.15,        "Responder","NonResponder"),
+    resp_20      = ifelse(pct_delta <= -0.20,        "Responder","NonResponder"),
+    resp_25      = ifelse(pct_delta <= -0.25,        "Responder","NonResponder"),
+    resp_30      = ifelse(pct_delta <= -0.30,        "Responder","NonResponder"),
+    resp_35      = ifelse(pct_delta <= -0.35,        "Responder","NonResponder"),
+    resp_40      = ifelse(pct_delta <= -0.40,        "Responder","NonResponder"),
+    resp_45      = ifelse(pct_delta <= -0.45,        "Responder","NonResponder"),
+    resp_50      = ifelse(pct_delta <= -0.50,        "Responder","NonResponder"))
+
+
+##  Stack Almond + Cracker, reshape rules long --------------------------
+
+dat_inf <- bind_rows(
+  almond_inflm %>% mutate(Treatment = "Almond"),
+  cracker_inflm %>% mutate(Treatment = "Cracker")) %>%
+  dplyr::select(
+    Subject, Treatment,
+    resp_primary, resp_15, resp_20, resp_25, resp_30,resp_35, resp_40, resp_45, resp_50) %>%
+  pivot_longer(
+    cols      = starts_with("resp_"),
+    names_to  = "rule",
+    values_to = "resp") %>%
+  filter(!is.na(resp)) %>%
+  mutate(
+    Treatment = factor(Treatment, levels = c("Cracker","Almond")),
+    resp      = factor(resp, levels = c("NonResponder","Responder")))
+
+
+
+# Week 12
+
+# Basic column names 
+id_col    <- "ID"
+week_col  <- "Week"
+trt_col   <- "Treatment"
+cal_col   <- "Calprotectin"
+delta_col <- "Calprotectin_d12"
+
+# Extract metadata and create Subject 
+almond_meta <- as(sample_data(ps_n), "data.frame") %>%
+  mutate(
+    Subject = str_replace(!!sym(id_col), "_(0|4|12)$", ""))
+
+# Wide table of calprotectin (wk0 & wk4) and % change 
+cal_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(cal_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 12)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, CAL = !!sym(cal_col)) %>%
+  pivot_wider(names_from = Week, values_from = CAL, names_prefix = "wk") %>%
+  mutate(
+    pct_delta         = (wk12 - wk0) / wk0,          
+    pct_delta_percent = pct_delta * 100 )
+
+# Restrict to inflamed subjects 
+
+cal_inf <- cal_wide %>% filter(Subject %in% inflamed_both)
+
+# Optionally remove missing subject 
+out_alm <- "ALM022"
+cal_inf <- cal_inf %>%
+  filter(Subject != out_alm)
+
+
+
+# Define responder / non-responder labels in inflamed subjects
+
+# Almond arm only (inflamed)
+almond_inflm <- cal_inf %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder","NonResponder"),
+    resp_15      = ifelse(pct_delta <= -0.15,        "Responder","NonResponder"),
+    resp_20      = ifelse(pct_delta <= -0.20,        "Responder","NonResponder"),
+    resp_25      = ifelse(pct_delta <= -0.25,        "Responder","NonResponder"),
+    resp_30      = ifelse(pct_delta <= -0.30,        "Responder","NonResponder"),
+    resp_35      = ifelse(pct_delta <= -0.35,        "Responder","NonResponder"),
+    resp_40      = ifelse(pct_delta <= -0.40,        "Responder","NonResponder"),
+    resp_45      = ifelse(pct_delta <= -0.45,        "Responder","NonResponder"),
+    resp_50      = ifelse(pct_delta <= -0.50,        "Responder","NonResponder"))
+
+# Cracker arm only (inflamed)
+cracker_inflm <- cal_inf %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder","NonResponder"),
+    resp_15      = ifelse(pct_delta <= -0.15,        "Responder","NonResponder"),
+    resp_20      = ifelse(pct_delta <= -0.20,        "Responder","NonResponder"),
+    resp_25      = ifelse(pct_delta <= -0.25,        "Responder","NonResponder"),
+    resp_30      = ifelse(pct_delta <= -0.30,        "Responder","NonResponder"),
+    resp_35      = ifelse(pct_delta <= -0.35,        "Responder","NonResponder"),
+    resp_40      = ifelse(pct_delta <= -0.40,        "Responder","NonResponder"),
+    resp_45      = ifelse(pct_delta <= -0.45,        "Responder","NonResponder"),
+    resp_50      = ifelse(pct_delta <= -0.50,        "Responder","NonResponder"))
+
+
+
+# Stack Almond + Cracker, reshape rules long 
+
+dat_inf <- bind_rows(
+  almond_inflm %>% mutate(Treatment = "Almond"),
+  cracker_inflm %>% mutate(Treatment = "Cracker")) %>%
+  dplyr::select(
+    Subject, Treatment,
+    resp_primary, resp_15, resp_20, resp_25, resp_30,resp_35, resp_40, resp_45, resp_50) %>%
+  pivot_longer(
+    cols      = starts_with("resp_"),
+    names_to  = "rule",
+    values_to = "resp") %>%
+  filter(!is.na(resp)) %>%
+  mutate(
+    Treatment = factor(Treatment, levels = c("Cracker","Almond")),
+    resp      = factor(resp, levels = c("NonResponder","Responder")))
+
+
+# MPO -------------------------------------------------------------------------
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+mpo_col <- "MPO"
+delta_col <- "MPO_d4"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to 1 row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(trt_col)),
+    MPO_d4 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & MPO_d4 <= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_15 = ifelse(Treatment == 1 & MPO_d4 <= 0.15, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_20 = ifelse(Treatment == 1 & MPO_d4 <= 0.2, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+# Build subject level baseline mpo (% of changes from baseline)
+mpo_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(mpo_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 4)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, MPO = !!sym(mpo_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = MPO, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk4 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+
+
+almpo_labels <- mpo_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_15  = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta <= -0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta <= -0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder"),)
+
+crampo_labels <- mpo_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_15  = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta <= -0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta <= -0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder"),)
+
+
+
+
+# MPO on inflamed IDs----------------------------
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+mpo_col <- "MPO"
+delta_col <- "MPO_d4"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(trt_col)),
+    MPO_d4 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & MPO_d4 <= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_15 = ifelse(Treatment == 1 & MPO_d4 <= 0.15, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_20 = ifelse(Treatment == 1 & MPO_d4 <= 0.2, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+# Build subject level baseline mpo (% of changes from baseline)
+mpo_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(mpo_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 4)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, MPO = !!sym(mpo_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = MPO, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk4 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+mpo_inf <- mpo_wide %>%
+  filter(Subject %in% inflamed_both)
+
+
+almpo_inflm <- mpo_inf %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_15  = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta <= -0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta <= -0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder"),)
+
+
+crampo_inflm <- mpo_inf %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_15  = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta <= -0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta <= -0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder"),)
+
+
+## Insulin---------------------------------------------------------------------
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+ins_col <- "Insulin"
+delta_col <- "Insulin_d12"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(trt_col)),
+    Insulin_d12 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & Insulin_d12 <= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_5 = ifelse(Treatment == 1 & Insulin_d12 <= 0.05, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_10 = ifelse(Treatment == 1 & Insulin_d12 <= 0.1, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+# Build subject level baseline Insulin (% of changes from baseline)
+ins_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(ins_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 12)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, INS = !!sym(ins_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = INS, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk12 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+
+alins_labels <- ins_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_10 = ifelse(pct_delta <= -0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    #resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    #resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    #resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    #resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    #resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder")
+    )
+
+
+crins_labels <- ins_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta <= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta <= -0.05, "Responder", "NonResponder"),
+    resp_10 = ifelse(pct_delta <= -0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta <= -0.15, "Responder", "NonResponder"),
+    #resp_30 = ifelse(pct_delta <= -0.30, "Responder", "NonResponder"),
+    #resp_35 = ifelse(pct_delta <= -0.35, "Responder", "NonResponder"),
+    #resp_40 = ifelse(pct_delta <= -0.4, "Responder", "NonResponder"),
+    #resp_45 = ifelse(pct_delta <= -0.45, "Responder", "NonResponder"),
+    #resp_50 = ifelse(pct_delta <= -0.5, "Responder", "NonResponder"),
+  )
+
+
+
+## a_CEHC/C-----------------------------------------------------------------------
+# Week 4
+
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+chc_col <- "aCHC.C"
+delta_col <- "aCHC.C_d4"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(chc_col)),
+    aCHC.C_d4 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & aCHC.C_d4 >= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_10 = ifelse(Treatment == 1 & aCHC.C_d4 >= 0.10, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_15 = ifelse(Treatment == 1 & aCHC.C_d4 >= 0.15, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+# Build subject level baseline aCHC/C (% of changes from baseline)
+chc_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(chc_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 4)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, aCHC.C = !!sym(chc_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = aCHC.C, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk4 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+
+almonch_labels <- chc_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta >= thr_moderate2, "Responder", "NonResponder"),
+    resp_10  = ifelse(pct_delta >= 0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta >= 0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta >= 0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta >= 0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta >= 0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta >= 0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta >= 0.40, "Responder", "NonResponder"),)
+
+
+crackech_labels <- chc_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta >= thr_moderate2, "Responder", "NonResponder"),
+    resp_10  = ifelse(pct_delta >= 0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta >= 0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta >= 0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta >= 0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta >= 0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta >= 0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta >= 0.40, "Responder", "NonResponder"),)
+
+
+
+# Week 12
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+chc_col <- "aCHC.C"
+delta_col <- "aCHC.C_d12"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(chc_col)),
+    aCHC.C_d12 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & aCHC.C_d12 >= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_10 = ifelse(Treatment == 1 & aCHC.C_d12 >= 0.10, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_15 = ifelse(Treatment == 1 & aCHC.C_d12 >= 0.15, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+
+# Build subject level baseline aCHC/C (% of changes from baseline)
+chc_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(chc_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 12)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, aCHC.C = !!sym(chc_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = aCHC.C, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk12 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+
+almonch_labels <- chc_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta >= thr_moderate2, "Responder", "NonResponder"),
+    resp_10  = ifelse(pct_delta >= 0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta >= 0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta >= 0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta >= 0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta >= 0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta >= 0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta >= 0.40, "Responder", "NonResponder"),)
+
+
+crackech_labels <- chc_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta >= thr_moderate2, "Responder", "NonResponder"),
+    resp_10  = ifelse(pct_delta >= 0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta >= 0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta >= 0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta >= 0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta >= 0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta >= 0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta >= 0.40, "Responder", "NonResponder"),)
+
+
+#aTC/Chol-----------------------------------------------------------------------
+
+# Week 4
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+at_col <- "aT.Chol"
+delta_col <- "aT.Chol_d4"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(at_col)),
+    aT.Chol_d4 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & aT.Chol_d4 >= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_5 = ifelse(Treatment == 1 & aT.Chol_d4 >= 0.05, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_10 = ifelse(Treatment == 1 & aT.Chol_d4 >= 0.10, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+# Build subject level baseline aCHC/C (% of changes from baseline)
+at_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(at_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 4)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, aT.Chol = !!sym(at_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = aT.Chol, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk4 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+almena_labels <- at_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta >= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta >= 0.05, "Responder", "NonResponder"),
+    resp_10  = ifelse(pct_delta >= 0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta >= 0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta >= 0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta >= 0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta >= 0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta >= 0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta >= 0.40, "Responder", "NonResponder"),)
+
+
+crackena_labels <- at_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta >= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta >= 0.05, "Responder", "NonResponder"),
+    resp_10  = ifelse(pct_delta >= 0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta >= 0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta >= 0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta >= 0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta >= 0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta >= 0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta >= 0.40, "Responder", "NonResponder"),)
+
+
+# Week 12
+id_col <- "ID"
+week_col <- "Week"
+trt_col <- "Treatment"
+at_col <- "aT.Chol"
+delta_col <- "aT.Chol_d12"
+
+# Extract almond IDs
+almond_meta <- as(sample_data(ps_n), "data.frame")
+almond_meta <- almond_meta %>%
+  mutate(Subject = str_replace(!! sym(id_col), "_(0|4|12)", ""))
+
+# Collapse to one row
+subj_tab <- almond_meta %>%
+  arrange(Subject, !!sym(week_col)) %>%
+  group_by(Subject) %>%
+  summarise(
+    Treatment = dplyr::first( !! sym(at_col)),
+    aT.Chol_d12 = dplyr::first(!! sym(delta_col)),
+    .groups = "drop")
+
+
+
+# Add Responder, Non_responder lables
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_primary = case_when(
+      Treatment == 1 & aT.Chol_d12 >= thr_moderate ~ "Responder",
+      Treatment == 1                           ~ "NonResponder",
+      TRUE                                     ~ NA_character_))
+
+# Sensitivity check based on fixed thresholds
+subj_tab <- subj_tab %>%
+  mutate(
+    resp_5 = ifelse(Treatment == 1 & aT.Chol_d12 >= 0.05, "Responder",
+                     ifelse(Treatment == 1 , "NonResponder", NA)),
+    resp_10 = ifelse(Treatment == 1 & aT.Chol_d12 >= 0.10, "Responder",
+                     ifelse(Treatment == 1, "NonResponder", NA)))
+  
+
+# Build subject level baseline aTC/Chol (% of changes from baseline)
+at_wide <- almond_meta %>%
+  dplyr::select(Subject, !!sym(week_col), !!sym(trt_col), !!sym(at_col)) %>%
+  mutate(Week = !!sym(week_col)) %>%
+  filter(Week %in% c(0, 12)) %>%
+  dplyr::select(Subject, Treatment = !!sym(trt_col), Week, aT.Chol = !!sym(at_col)) %>%
+  tidyr::pivot_wider(names_from = Week, values_from = aT.Chol, names_prefix = "wk") %>%
+  mutate(pct_delta = (wk12 - wk0) /wk0,
+         pct_delta_percent = pct_delta*100)
+
+
+almena_labels <- at_wide %>%
+  filter(Treatment == 1) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta >= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta >= 0.05, "Responder", "NonResponder"),
+    resp_10  = ifelse(pct_delta >= 0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta >= 0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta >= 0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta >= 0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta >= 0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta >= 0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta >= 0.40, "Responder", "NonResponder"),)
+
+
+crackena_labels <- at_wide %>%
+  filter(Treatment == 0) %>%
+  mutate(
+    resp_primary = ifelse(pct_delta >= thr_moderate2, "Responder", "NonResponder"),
+    resp_5  = ifelse(pct_delta >= 0.05, "Responder", "NonResponder"),
+    resp_10  = ifelse(pct_delta >= 0.10, "Responder", "NonResponder"),
+    resp_15 = ifelse(pct_delta >= 0.15, "Responder", "NonResponder"),
+    resp_20 = ifelse(pct_delta >= 0.20, "Responder", "NonResponder"),
+    resp_25 = ifelse(pct_delta >= 0.25, "Responder", "NonResponder"),
+    resp_30 = ifelse(pct_delta >= 0.30, "Responder", "NonResponder"),
+    resp_35 = ifelse(pct_delta >= 0.35, "Responder", "NonResponder"),
+    resp_40 = ifelse(pct_delta >= 0.40, "Responder", "NonResponder"),)
+
+```
+
+
+
+
+# Differential abundance analysis based on Responder/NonResponders (15% Reduction in LDL-C)
+```{r}
+# Load required libraries
+library(microViz)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(RColorBrewer)
+library(dplyr)
+library(phyloseq)
+library(tidyr)
+library(tibble)
+library(tidyverse)
+library(glmmTMB)
+library(emmeans)
+library(purrr)
+library(broom.mixed)
+
+# NB Model With Prevalence Cut-off
+almond_melt <- melted_data %>%
+  mutate(Subject = sub("_(0|4|12)$", "", Sample)) %>%
+  filter(Treatment == "Almond")
+
+almond_melted <- almond_melt %>%
+  left_join( almond_labels %>% 
+      mutate(resp_15 = factor(resp_15, levels = c("NonResponder", "Responder"))),
+    by = "Subject") %>%
+  mutate(
+    Week    = fct_relevel(Week, "Week0","Week4","Week12"),
+    resp_15 = fct_relevel(resp_15, "NonResponder","Responder"),
+    Genus   = as.character(Genus))
+
+
+# Set a Prevalence Filter
+prev_cutoff <- 0.10   
+
+prev_tab <- almond_melted %>%
+  group_by(Genus) %>%
+  summarise(
+    prev = mean(Abundance > 0),
+    .groups = "drop")
+
+keep_genera <- prev_tab %>%
+  filter(prev >= prev_cutoff) %>%
+  pull(Genus)
+
+almond_filt <- almond_melted %>%
+  filter(Genus %in% keep_genera)
+
+
+# Define GLMM function
+glmm_resp <- function(df){
+  glmmTMB(
+    Abundance ~ resp_15 * Week + (1 | Subject),
+    family = nbinom2,
+    data   = df,
+    offset = log(total))
+}
+
+safe_glmm_resp <- purrr::possibly(glmm_resp, otherwise = NULL)
+
+# Fit a Model for one Genus only
+almond_fit <- almond_filt %>%
+  nest(data = -Genus) %>%
+  mutate(
+    fit = purrr::map(data, safe_glmm_resp)  
+  ) %>%
+  filter(!purrr::map_lgl(fit, is.null))
+
+
+# Tidy Fixed Effects Per Model
+almond_tidy <- almond_fit %>%
+  mutate(
+    tidied = purrr::map(fit, ~ broom.mixed::tidy(.x, effects = "fixed"))
+  ) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  filter(is.finite(estimate), !is.na(p.value)) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+
+# Custom Emmeans Contrasts
+run_emmeans_resp <- function(model){
+  emms <- emmeans(model, ~ resp_15 * Week)
+
+  emmeans::contrast(
+    emms,
+    method = list(
+      "R_vs_NR_W0"  = c(-1, +1,  0,  0,  0,  0),
+      "R_vs_NR_W4"  = c( 0,  0, -1, +1,  0,  0),
+      "R_vs_NR_W12" = c( 0,  0,  0,  0, -1, +1),
+      "R_W4_vs_R_W0"  = c(0, -1, 0, +1, 0, 0),
+      "R_W12_vs_R_W0" = c(0, -1, 0, 0, 0, +1),
+      "NR_W4_vs_NR_W0"  = c(-1, 0, +1, 0, 0, 0),
+      "NR_W12_vs_NR_W0" = c(-1, 0, 0, 0, +1, 0)
+    )
+  ) %>% 
+    broom::tidy()
+}
+
+
+emm_contr_filt <- almond_fit %>%
+  mutate(
+    emms_resp = purrr::map(fit, ~ tryCatch(run_emmeans_resp(.x), error = function(e) NULL))
+  ) %>%
+  filter(!purrr::map_lgl(emms_resp, is.null)) %>%
+  unnest(emms_resp) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+# Extract Significant Contrasts
+sig_fdr_ldl <- emm_contr_filt %>%
+  filter(p.adj < 0.1)
+
+
+
+
+## Add Ratio + CI---------------------------------------------------------------
+emm_contr_filt_rr <- emm_contr_filt %>%
+  mutate(
+    ratio   = exp(estimate),
+    ci_low  = exp(estimate - 1.96 * std.error),
+    ci_high = exp(estimate + 1.96 * std.error))
+
+
+```
+
+
+
+# Resp/Non-Resp NB Differential Abundance on Total Colestrol (10% Reduction)
+```{r}
+# Load required libraries
+library(microViz)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(RColorBrewer)
+library(dplyr)
+library(phyloseq)
+library(tidyr)
+library(tibble)
+library(tidyverse)
+library(glmmTMB)
+library(emmeans)
+library(purrr)
+library(broom.mixed)
+
+
+# NB Model With Prevalence Cut-off----------------------------------------------
+almont_melt <- melted_data %>%
+  mutate(Subject = sub("_(0|4|12)$", "", Sample)) %>%
+  filter(Treatment == "Almond")
+
+almont_melted <- almont_melt %>%
+  left_join(
+    almont_labels %>% 
+      mutate(resp_10 = factor(resp_10, levels = c("NonResponder", "Responder"))),
+    by = "Subject") %>%
+  mutate(
+    Week    = fct_relevel(Week, "Week0","Week4","Week12"),
+    resp_10 = fct_relevel(resp_10, "NonResponder","Responder"),
+    Genus   = as.character(Genus))
+
+
+# Set a Prevalence Filter
+prev_cutoff <- 0.10   
+
+prev_tab <- almont_melted %>%
+  group_by(Genus) %>%
+  summarise(
+    prev = mean(Abundance > 0),
+    .groups = "drop")
+
+keep_genera <- prev_tab %>%
+  filter(prev >= prev_cutoff) %>%
+  pull(Genus)
+
+almont_filt <- almont_melted %>%
+  filter(Genus %in% keep_genera)
+
+
+# Define GLMM function
+glmm_resp <- function(df){
+  glmmTMB(
+    Abundance ~ resp_10 * Week + (1 | Subject),
+    family = nbinom2,
+    data   = df,
+    offset = log(total))}
+
+safe_glmm_resp <- purrr::possibly(glmm_resp, otherwise = NULL)
+
+# Fit a Model for one Genus only
+almont_fit <- almont_filt %>%
+  nest(data = -Genus) %>%
+  mutate(
+    fit = purrr::map(data, safe_glmm_resp)  
+  ) %>%
+  filter(!purrr::map_lgl(fit, is.null))
+
+
+# Tidy Fixed Effects Per Model
+almont_tidy <- almont_fit %>%
+  mutate(
+    tidied = purrr::map(fit, ~ broom.mixed::tidy(.x, effects = "fixed"))
+  ) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  filter(is.finite(estimate), !is.na(p.value)) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+
+# Costum Emmeans Contrasts
+run_emmeans_resp <- function(model){
+  emms <- emmeans(model, ~ resp_10 * Week)
+
+  emmeans::contrast(
+    emms,
+    method = list(
+      "R_vs_NR_W0"  = c(-1, +1,  0,  0,  0,  0),
+      "R_vs_NR_W4"  = c( 0,  0, -1, +1,  0,  0),
+      "R_vs_NR_W12" = c( 0,  0,  0,  0, -1, +1),
+      "R_W4_vs_R_W0"  = c(0, -1, 0, +1, 0, 0),
+      "R_W12_vs_R_W0" = c(0, -1, 0, 0, 0, +1),
+      "NR_W4_vs_NR_W0"  = c(-1, 0, +1, 0, 0, 0),
+      "NR_W12_vs_NR_W0" = c(-1, 0, 0, 0, +1, 0)
+    )
+  ) %>% 
+    broom::tidy()
+}
+
+
+emm_contr_filt <- almont_fit %>%
+  mutate(
+    emms_resp = purrr::map(fit, ~ tryCatch(run_emmeans_resp(.x), error = function(e) NULL))
+  ) %>%
+  filter(!purrr::map_lgl(emms_resp, is.null)) %>%
+  unnest(emms_resp) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+# Extract Significant Contrasts
+sig_nb_tc <- emm_contr_filt %>%
+  filter(p.adj < 0.10)
+
+## Add Ratio + CI
+emm_contr_filt_rr <- emm_contr_filt %>%
+  mutate(
+    ratio   = exp(estimate),
+    ci_low  = exp(estimate - 1.96 * std.error),
+    ci_high = exp(estimate + 1.96 * std.error))
+```
+
+
+
+# Resp/Non-Resp NB Differential Abundance on a-CHC/Cholestrol (35% Increase)
+```{r}
+# Load required libraries
+library(microViz)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(RColorBrewer)
+library(dplyr)
+library(phyloseq)
+library(tidyr)
+library(tibble)
+library(tidyverse)
+library(glmmTMB)
+library(emmeans)
+library(purrr)
+library(broom.mixed)
+
+
+# NB Model With Prevalence Cut-off----------------------------------------------
+almonch_melt <- melted_data %>%
+  mutate(Subject = sub("_(0|4|12)$", "", Sample)) %>%
+  filter(Treatment == "Almond")
+
+almonch_melted <- almonch_melt %>%
+  left_join(
+    almonch_labels %>% 
+      mutate(resp_35 = factor(resp_35, levels = c("NonResponder", "Responder"))),
+    by = "Subject") %>%
+  mutate(
+    Week    = fct_relevel(Week, "Week0","Week4","Week12"),
+    resp_35 = fct_relevel(resp_35, "NonResponder","Responder"),
+    Genus   = as.character(Genus))
+
+
+# Set a Prevalence Filter
+prev_cutoff <- 0.10   
+
+prev_tab <- almonch_melted %>%
+  group_by(Genus) %>%
+  summarise(
+    prev = mean(Abundance > 0),
+    .groups = "drop"
+  )
+
+keep_genera <- prev_tab %>%
+  filter(prev >= prev_cutoff) %>%
+  pull(Genus)
+
+almonch_filt <- almonch_melted %>%
+  filter(Genus %in% keep_genera)
+
+
+# Define GLMM function
+glmm_resp <- function(df){
+  glmmTMB(
+    Abundance ~ resp_35 * Week + (1 | Subject),
+    family = nbinom2,
+    data   = df,
+    offset = log(total))
+}
+
+safe_glmm_resp <- purrr::possibly(glmm_resp, otherwise = NULL)
+
+# Fit a Model for one Genus only
+almonch_fit <- almonch_filt %>%
+  nest(data = -Genus) %>%
+  mutate(
+    fit = purrr::map(data, safe_glmm_resp)  
+  ) %>%
+  filter(!purrr::map_lgl(fit, is.null))
+
+
+# Tidy Fixed Effects Per Model
+almonch_tidy <- almonch_fit %>%
+  mutate(
+    tidied = purrr::map(fit, ~ broom.mixed::tidy(.x, effects = "fixed"))
+  ) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  filter(is.finite(estimate), !is.na(p.value)) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+
+# Costum Emmeans Contrasts
+run_emmeans_resp <- function(model){
+  emms <- emmeans(model, ~ resp_35 * Week)
+
+  emmeans::contrast(
+    emms,
+    method = list(
+      "R_vs_NR_W0"  = c(-1, +1,  0,  0,  0,  0),
+      "R_vs_NR_W4"  = c( 0,  0, -1, +1,  0,  0),
+      "R_vs_NR_W12" = c( 0,  0,  0,  0, -1, +1),
+      "R_W4_vs_R_W0"  = c(0, -1, 0, +1, 0, 0),
+      "R_W12_vs_R_W0" = c(0, -1, 0, 0, 0, +1),
+      "NR_W4_vs_NR_W0"  = c(-1, 0, +1, 0, 0, 0),
+      "NR_W12_vs_NR_W0" = c(-1, 0, 0, 0, +1, 0)
+    )
+  ) %>% 
+    broom::tidy()
+}
+
+
+emm_chc_filt <- almonch_fit %>%
+  mutate(
+    emms_resp = purrr::map(fit, ~ tryCatch(run_emmeans_resp(.x), error = function(e) NULL))
+  ) %>%
+  filter(!purrr::map_lgl(emms_resp, is.null)) %>%
+  unnest(emms_resp) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+# Extract Significant Contrasts
+sig_nb_chc <- emm_chc_filt %>%
+  filter(p.adj < 0.10)
+
+## Add Ratio + CI
+emm_contr_filt_rr <- emm_contr_filt %>%
+  mutate(
+    ratio   = exp(estimate),
+    ci_low  = exp(estimate - 1.96 * std.error),
+    ci_high = exp(estimate + 1.96 * std.error) )
+
+```
+
+
+
+
+
+
+
+# Resp/NonResp NB DFA Based on aTC/Chol (5% Increase at Week4)
+```{r}
+# Load required libraries
+library(microViz)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(RColorBrewer)
+library(dplyr)
+library(phyloseq)
+library(tidyr)
+library(tibble)
+library(tidyverse)
+library(glmmTMB)
+library(emmeans)
+library(purrr)
+library(broom.mixed)
+
+
+# NB Model With Prevalence Cut-off----------------------------------------------
+almena_melt <- melted_data %>%
+  mutate(Subject = sub("_(0|4|12)$", "", Sample)) %>%
+  filter(Treatment == "Almond")
+
+almena_melted <- almena_melt %>%
+  left_join(
+    almena_labels %>% 
+      mutate(resp_5 = factor(resp_5, levels = c("NonResponder", "Responder"))),
+    by = "Subject"
+  ) %>%
+  mutate(
+    Week    = fct_relevel(Week, "Week0","Week4","Week12"),
+    resp_5 = fct_relevel(resp_5, "NonResponder","Responder"),
+    Genus   = as.character(Genus)
+  )
+
+
+# Set a Prevalence Filter
+prev_cutoff <- 0.10   
+
+prev_tab <- almena_melted %>%
+  group_by(Genus) %>%
+  summarise(
+    prev = mean(Abundance > 0),
+    .groups = "drop"
+  )
+
+keep_genera <- prev_tab %>%
+  filter(prev >= prev_cutoff) %>%
+  pull(Genus)
+
+almena_filt <- almena_melted %>%
+  filter(Genus %in% keep_genera)
+
+
+# Define GLMM function
+glmm_resp <- function(df){
+  glmmTMB(
+    Abundance ~ resp_5 * Week + (1 | Subject),
+    family = nbinom2,
+    data   = df,
+    offset = log(total)
+  )
+}
+
+safe_glmm_resp <- purrr::possibly(glmm_resp, otherwise = NULL)
+
+# Fit a Model for one Genus only
+almena_fit <- almena_filt %>%
+  nest(data = -Genus) %>%
+  mutate(
+    fit = purrr::map(data, safe_glmm_resp)  
+  ) %>%
+  filter(!purrr::map_lgl(fit, is.null))
+
+
+# Tidy Fixed Effects Per Model
+almena_tidy <- almena_fit %>%
+  mutate(
+    tidied = purrr::map(fit, ~ broom.mixed::tidy(.x, effects = "fixed"))
+  ) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  filter(is.finite(estimate), !is.na(p.value)) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+
+# Costum Emmeans Contrasts
+run_emmeans_resp <- function(model){
+  emms <- emmeans(model, ~ resp_5 * Week)
+
+  emmeans::contrast(
+    emms,
+    method = list(
+      "R_vs_NR_W0"  = c(-1, +1,  0,  0,  0,  0),
+      "R_vs_NR_W4"  = c( 0,  0, -1, +1,  0,  0),
+      "R_vs_NR_W12" = c( 0,  0,  0,  0, -1, +1),
+      "R_W4_vs_R_W0"  = c(0, -1, 0, +1, 0, 0),
+      "R_W12_vs_R_W0" = c(0, -1, 0, 0, 0, +1),
+      "NR_W4_vs_NR_W0"  = c(-1, 0, +1, 0, 0, 0),
+      "NR_W12_vs_NR_W0" = c(-1, 0, 0, 0, +1, 0)
+    )
+  ) %>% 
+    broom::tidy()
+}
+
+
+emm_at_filt <- almena_fit %>%
+  mutate(
+    emms_resp = purrr::map(fit, ~ tryCatch(run_emmeans_resp(.x), error = function(e) NULL))
+  ) %>%
+  filter(!purrr::map_lgl(emms_resp, is.null)) %>%
+  unnest(emms_resp) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+# Extract Significant Contrasts
+sig_nb_at <- emm_at_filt %>%
+  filter(p.adj < 0.10)
+
+## Add Ratio + CI
+emm_contr_filt_rr <- emm_contr_filt %>%
+  mutate(
+    ratio   = exp(estimate),
+    ci_low  = exp(estimate - 1.96 * std.error),
+    ci_high = exp(estimate + 1.96 * std.error))
+
+```
+
+
+
+
+# Resp/Non-Resp NB Differential Abundance on Insulin (15% Reduction)
+```{r}
+# Load required libraries
+library(microViz)
+library(ggplot2)
+library(ggpubr)
+library(reshape2)
+library(RColorBrewer)
+library(dplyr)
+library(phyloseq)
+library(tidyr)
+library(tibble)
+library(tidyverse)
+library(glmmTMB)
+library(emmeans)
+library(purrr)
+library(broom.mixed)
+
+
+# NB Model With Prevalence Cut-off----------------------------------------------
+almins_melt <- melted_data %>%
+  mutate(Subject = sub("_(0|4|12)$", "", Sample)) %>%
+  filter(Treatment == "Almond")
+
+almins_melted <- almins_melt %>%
+  left_join(
+    alins_labels %>% 
+      mutate(resp_15 = factor(resp_15, levels = c("NonResponder", "Responder"))),
+    by = "Subject"
+  ) %>%
+  mutate(
+    Week    = fct_relevel(Week, "Week0","Week4","Week12"),
+    resp_15 = fct_relevel(resp_15, "NonResponder","Responder"),
+    Genus   = as.character(Genus)
+  )
+
+
+# Set a Prevalence Filter
+prev_cutoff <- 0.10   
+
+prev_tab <- almins_melted %>%
+  group_by(Genus) %>%
+  summarise(
+    prev = mean(Abundance > 0),
+    .groups = "drop"
+  )
+
+keep_genera <- prev_tab %>%
+  filter(prev >= prev_cutoff) %>%
+  pull(Genus)
+
+almins_filt <- almins_melted %>%
+  filter(Genus %in% keep_genera)
+
+
+# Define GLMM function
+glmm_resp <- function(df){
+  glmmTMB(
+    Abundance ~ resp_15 * Week + (1 | Subject),
+    family = nbinom2,
+    data   = df,
+    offset = log(total)
+  )
+}
+
+safe_glmm_resp <- purrr::possibly(glmm_resp, otherwise = NULL)
+
+# Fit a Model for one Genus only
+almins_fit <- almins_filt %>%
+  nest(data = -Genus) %>%
+  mutate(
+    fit = purrr::map(data, safe_glmm_resp)  
+  ) %>%
+  filter(!purrr::map_lgl(fit, is.null))
+
+
+# Tidy Fixed Effects Per Model
+almins_tidy <- almins_fit %>%
+  mutate(
+    tidied = purrr::map(fit, ~ broom.mixed::tidy(.x, effects = "fixed"))
+  ) %>%
+  unnest(tidied) %>%
+  filter(term != "(Intercept)") %>%
+  filter(is.finite(estimate), !is.na(p.value)) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+
+# Costum Emmeans Contrasts
+run_emmeans_resp <- function(model){
+  emms <- emmeans(model, ~ resp_15 * Week)
+
+  emmeans::contrast(
+    emms,
+    method = list(
+      "R_vs_NR_W0"  = c(-1, +1,  0,  0,  0,  0),
+      "R_vs_NR_W4"  = c( 0,  0, -1, +1,  0,  0),
+      "R_vs_NR_W12" = c( 0,  0,  0,  0, -1, +1),
+      "R_W4_vs_R_W0"  = c(0, -1, 0, +1, 0, 0),
+      "R_W12_vs_R_W0" = c(0, -1, 0, 0, 0, +1),
+      "NR_W4_vs_NR_W0"  = c(-1, 0, +1, 0, 0, 0),
+      "NR_W12_vs_NR_W0" = c(-1, 0, 0, 0, +1, 0)
+    )
+  ) %>% 
+    broom::tidy()
+}
+
+
+emm_ins_filt <- almins_fit %>%
+  mutate(
+    emms_resp = purrr::map(fit, ~ tryCatch(run_emmeans_resp(.x), error = function(e) NULL))
+  ) %>%
+  filter(!purrr::map_lgl(emms_resp, is.null)) %>%
+  unnest(emms_resp) %>%
+  mutate(p.adj = p.adjust(p.value, method = "fdr"))
+
+# Extract Significant Contrasts
+sig_nb_ins <- emm_ins_filt %>%
+  filter(p.adj < 0.10)
+
+
+
+## Add Ratio + CI
+emm_contr_filt_rr <- emm_contr_filt %>%
+  mutate(
+    ratio   = exp(estimate),
+    ci_low  = exp(estimate - 1.96 * std.error),
+    ci_high = exp(estimate + 1.96 * std.error))
+
+```
+
+
+
+
+
+
+# Oxylipins
+```{r}
+#install.packages("janitor")
+#install.packages("reader")
+library(tidyverse)   
+library(janitor)
+library(rstatix)
+library(broom)
+library(reader)
+library(ggplot2)
+
+## Analytes list one by one-----------------------------------------------------
+analyte1 <- "x12s_hh_tr_e"
+analyte2 <- "a_linolenic_acid"
+analyte3 <- "arachidonic_acid"
+analyte4 <- "dha"
+analyte5 <- "epa"
+analyte6 <- "pgd2"
+analyte7 <- "txb2"
+analyte8 <- "x10_11_ep_dpa"
+analyte9 <- "x11_12_di_het"
+analyte10 <- "x11_12_eet"
+analyte11 <- "x11_hdha"
+analyte12 <- "x11_hete"
+analyte13 <- "x12_13_di_home"
+analyte14 <- "x12_13_ep_ome"
+analyte15 <- "x12_hepe"
+analyte16 <- "x12_hete"
+analyte17 <- "x13_hode"
+analyte18 <- "x13_kode"
+analyte19 <- "x13_s_ho_tr_e"
+analyte20 <- "x14_15_di_het"
+analyte21 <- "x14_15_eet"
+analyte22 <- "x14_15_ep_ete"
+analyte23 <- "x14_hdha"
+analyte24 <- "x15_16_ep_ode"
+analyte25 <- "x15_hepe"
+analyte26 <- "x15_hete"
+analyte27 <- "x16_17_di_hdpa"
+analyte28 <- "x16_hdha"
+analyte29 <- "x17_18_di_hete"
+analyte30 <- "x18_hepe"
+analyte31 <- "x18_hete"
+analyte32 <- "x19_20_di_hdpa"
+analyte33 <- "x20_hdha"
+analyte34 <- "x20_hete"
+analyte35 <- "x4_hdha"
+analyte36 <- "x5_6_di_het"
+analyte37 <- "x5_hepe"
+analyte38 <- "x5_hete"
+analyte39 <- "x7_8_ep_dpa"
+analyte40 <- "x7_hdha"
+analyte41 <- "x8_9_di_het"
+analyte42 <- "x8_9_eet"
+analyte43 <- "x8_9_ep_ete"
+analyte44 <- "x8_hdha"
+analyte45 <- "x8_hete"
+analyte46 <- "x9_10_di_home"
+analyte47 <- "x9_10_ep_ome"
+analyte48 <- "x9_hete"
+analyte49 <- "x9_hode"
+analyte50 <- "x9_kode"
+analyte51 <- "x9_s_ho_tr_e"
+analyte52 <- "x17_r_hdha"
+analyte53 <- "x13_14_ep_dpa"
+analyte54 <- "x13_hdha"
+
+# Read file and clean names
+raw_ox <- readr::read_csv("Oxylipins.csv", guess_max = 50000)
+
+# Drop completely empty columns
+raw_ox <- raw_ox[, colSums(!is.na(raw_ox)) > 0]
+
+# NA counts per column
+na_counts <- sapply(raw_ox, function(x) sum(is.na(x)))
+sort(na_counts, decreasing = TRUE)[1:12]
+sum(na_counts > 0) 
+
+# negatives (count per numeric column)
+num_cols <- names(raw_ox)[sapply(raw_ox, is.numeric)]
+neg_counts <- sapply(raw_ox[num_cols], function(x) sum(x < 0, na.rm = TRUE))
+neg_counts[neg_counts > 0]
+
+df_ox <- raw_ox %>% janitor::clean_names()
+names(df_ox)[1:10]
+table(df_ox$week, useNA = "ifany")
+table(df_ox$treatment, useNA = "ifany")
+unique(df_ox$sex)
+
+
+# Subject id, factor labels, pairing check
+df_ox <- df_ox %>%
+  mutate(
+    subject   = sub("_(0|12)$", "", sample_id),
+    week      = factor(week, levels = c(0,12), labels = c("Baseline","Week12")),
+    treatment = factor(treatment, levels = c(0,1), labels = c("Cracker","Almond")))
+
+
+
+#  figure out which columns are analytes
+non_analyte <- c("sample_id","week","cohort","treatment","age","sex","bmi","subject")
+analytes <- df_ox %>%
+  dplyr::select(where(is.numeric)) %>%
+  dplyr::select(-any_of(intersect(names(.), non_analyte))) %>%
+  names()
+
+
+#  NA counts among analytes
+na_overall <- sapply(df_ox[analytes], function(x) sum(is.na(x)))
+sort(na_overall, decreasing = TRUE)[1:12]
+sum(na_overall > 0)
+
+# Change to long format
+ox_long <- df_ox %>%
+  pivot_longer(all_of(analytes), names_to = "analyte", values_to = "value")
+
+
+# Replace NA values with half of the minimum value in the column
+ox_long <- ox_long %>%
+  dplyr::group_by(analyte) %>%
+  dplyr::mutate(
+    halfmin    = { v <- value[value > 0 & !is.na(value)]; if (length(v)==0) NA_real_ else 0.5*min(v) },
+    value_imp  = dplyr::if_else(is.na(value) | value <= 0, halfmin, value),
+    log_value  = log(value_imp)
+  ) %>%
+  dplyr::ungroup()
+
+  
+# Check Normality of Raw values
+raw_norm <- ox_long %>%
+  dplyr::group_by(analyte, week) %>%
+  dplyr::summarise(
+    n     = sum(!is.na(value_imp)),
+    p_raw = tryCatch(shapiro.test(value_imp)$p.value, error = function(e) NA_real_),
+    .groups = "drop")
+
+
+# Check Normality of Log Transformed Values
+log_norm <- ox_long %>%
+  dplyr::group_by(analyte, week) %>%
+  dplyr::summarise(
+    n     = sum(!is.na(log_value)),
+    p_log = tryCatch(shapiro.test(log_value)$p.value, error = function(e) NA_real_),
+    .groups = "drop")
+
+
+# Check normality of one specific analyte
+ox_long %>%
+  dplyr::filter(analyte == analyte17, week %in% c("Baseline", "Week12")) %>%
+  dplyr::group_by(week) %>%
+  dplyr::summarise(
+    n = sum(!is.na(value_imp)),
+    p_raw = tryCatch(shapiro.test(value_imp)$p.value, error = function(e) NA_real_),
+    p_log = tryCatch(shapiro.test(log_value)$p.value, error = function(e) NA_real_))
+
+
+
+#  set up baseline data on the log scale
+work <- ox_long %>%
+  dplyr::filter(week == "Baseline") %>%
+  dplyr::select(subject, treatment, analyte, y = log_value) %>%
+  tidyr::drop_na(y)
+
+
+# Check baseline differences    
+base_tests <- work %>%
+  dplyr::group_by(analyte) %>%
+  dplyr::group_modify(~{
+    p <- tryCatch(wilcox.test(y ~ treatment, data = .x, exact = FALSE)$p.value,
+                  error = function(e) NA_real_)
+    tibble::tibble(p = p)
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(p_fdr = p.adjust(p, method = "fdr")) %>%
+  dplyr::arrange(p_fdr)
+
+
+
+# Change to wide format
+dat_ox <- ox_long %>%
+  dplyr::select(subject, analyte, week, log_value) %>%
+  tidyr::pivot_wider(names_from = week, values_from = log_value,
+                     names_prefix = "y_") %>%   
+  dplyr::left_join(df_cov, by = "subject") %>%
+  tidyr::drop_na(y_Baseline, y_Week12)
+
+
+
+### Plots ---------------------------------------------------------------------
+
+# Line Plot
+pd <- position_dodge(width = 0.6)
+mean_se <- function(y){
+  y <- y[is.finite(y)]
+  m <- mean(y); se <- sd(y)/sqrt(length(y))
+  data.frame(y = m, ymin = m - se, ymax = m + se)
+}
+
+
+
+
+### Stats----------------------------------------------------------------------
+stats_df <- ox_long %>%
+  dplyr::group_by(analyte, week, treatment) %>%
+  dplyr::summarise(
+    n    = sum(is.finite(value_imp)),
+    mean = mean(value_imp, na.rm = TRUE),
+    sd   = sd(value_imp, na.rm = TRUE),
+    sem  = sd / sqrt(n),
+    .groups = "drop")
+
+
+# Week-12 stats (mean ± SEM) per analyte × treatment
+ox_base <- get0("ox_long", ifnotfound = long)
+
+stats_week12 <- ox_base %>%
+  dplyr::filter(week == "Week12") %>%
+  dplyr::group_by(analyte, treatment) %>%
+  dplyr::summarise(
+    n    = sum(is.finite(value_imp)),
+    mean = mean(value_imp, na.rm = TRUE),
+    sd   = sd(value_imp, na.rm = TRUE),
+    sem  = sd / sqrt(n),
+    .groups = "drop") %>% dplyr::arrange(analyte, treatment)
+
+# Print stats individually
+ox_long %>%
+  dplyr::filter(analyte == analyte17, week == "Week12") %>%
+  dplyr::group_by(treatment) %>%
+  dplyr::summarise(
+    n    = sum(is.finite(value_imp)),
+    mean = mean(value_imp, na.rm = TRUE),
+    sd   = sd(value_imp, na.rm = TRUE),
+    sem  = sd / sqrt(n),
+    .groups = "drop") %>%
+  dplyr::mutate(dplyr::across(c(mean, sd, sem), ~ signif(.x, 3)))
+
+
+
+
+# Calculate Changes from baseline
+base_change <- ox_long %>%
+  dplyr::select(subject, treatment, analyte, week, value_imp, log_value) %>%
+  pivot_wider(names_from = week, values_from = c(value_imp, log_value)) %>%
+  mutate(
+    delta_raw = value_imp_Week12 - value_imp_Baseline,
+    delta_log = log_value_Week12 - log_value_Baseline
+  ) %>%
+  tidyr::drop_na(delta_raw, delta_log)
+
+
+# Sign log transfrom changes from baseline levels
+base_change <- base_change %>%
+  dplyr::mutate(delta_slog = log_transform(delta_raw))
+
+### GLMM----------------------------------------------------------------------
+
+# Test GLMM model on one analyte
+ox_glmm <- glmmTMB(
+  value_imp ~ treatment*week + age + sex + bmi + (1|subject),
+  family = Gamma(link = "log"),
+  data = ox_long %>% dplyr::filter(analyte == analyte13))
+
+fit_no_int <- update(fit_gam, . ~ . - treatment:week)
+anova(fit_gam, fit_no_int)  
+
+
+# Define a function for GLMM on all analytes
+glmm_ox <- function(dat){
+  dat <- dat |>
+    dplyr::mutate(
+      treatment = droplevels(factor(treatment)),
+      week      = droplevels(factor(week)))
+  tryCatch({
+    fit_full  <- glmmTMB(value_imp ~ treatment*week + age + sex + bmi + (1|subject),
+                         family = Gamma(link = "log"), data = dat)
+    fit_noint <- update(fit_full, . ~ . - treatment:week)
+    lrt <- anova(fit_full, fit_noint)
+    tibble::tibble(
+      p_int = lrt$`Pr(>Chisq)`[2],
+      n     = nrow(dat))
+  }, error = function(e) tibble::tibble(p_int = NA_real_, n = nrow(dat)))}
+
+### Apply the function on all oxylipins
+q <- 0.10
+res_glmm <- ox_long %>%
+  group_by(analyte) %>%
+  group_modify(~ glmm_ox(.x)) %>%
+  ungroup() %>%
+  mutate(p_int_fdr = p.adjust(p_int, "fdr"),
+         p_int_q10 = p_int_fdr < q ) %>%
+  arrange(p_int_fdr)
+
+
+
+# Restrict Results to FDR 10%
+res_glmm <- res_glmm %>% 
+  mutate(sig_int_q10  = p_int_fdr < q,
+         sig_w12_q10  = p_w12_fdr < q)
+res_glmm %>% filter(sig_int_q10 == TRUE)
+res_glmm %>% filter(sig_w12_q10 == TRUE)
+
+
+
+
+#OR
+q_cutoff <- 0.10
+sig_glmm <- res_glmm %>%
+  filter(!is.na(p_int_fdr), p_int_fdr < q_cutoff)
+view(sig_glmm)
+sig_glmm_w12 <- res_glmm %>%
+  filter(!is.na(p_w12_fdr), p_w12_fdr < q_cutoff)
+
+
+## Bar Plots------------------------------------------------------------------
+ox_long <- ox_long %>%
+  dplyr::mutate(
+    week_num = as.integer(sub(".*_(0|12)$", "\\1", sample_id)),
+    week = factor(week_num, levels = c(0, 12), labels = c("Baseline", "Week12"))
+  ) %>% dplyr::select(-week_num)
+
+ox_long %>% dplyr::count(week, .drop = FALSE)
+
+pd <- position_dodge(width = 0.7)
+
+
+ox_long %>%
+  dplyr::filter(analyte %in% analyte17) %>%
+  ggplot(aes(x = week, y = value_imp, fill = treatment)) +
+  stat_summary(aes(group = treatment),
+               fun = mean, geom = "bar",
+               position = pd, width = 0.6, color = "black") +
+  stat_summary(aes(group = treatment),
+               fun.data = mean_se, geom = "errorbar",
+               position = pd, width = 0.15) +
+  scale_fill_manual(name = "Treatment",
+                    values = c(Cracker = "red", Almond = "blue")) +
+  labs(title = "13-HODE",
+       y = "Concentration",
+       x = NULL) +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
